@@ -1134,7 +1134,7 @@ interface TraceTaintReport {
 interface TraceDecompileOptions {
   /** 目标观测内存地址（与 `reg` 二选一） */
   addr?: number | bigint | string;
-  /** 目标内存宽度（1..8 字节，默认 4） */
+  /** 目标内存宽度（1..=64 字节，1..=8 返回标量，9..=64 联合反编译为 `void fn(..., uint8_t *out)`；默认 4） */
   len?: number;
   /** 目标观测寄存器名（如 `"x0"`, `"w0"`；与 `addr` 二选一） */
   reg?: string;
@@ -1160,7 +1160,7 @@ interface TraceDecompileOptions {
   functionName?: string;
   /** 是否启用代数/旋转/MBA/字节重装化简（默认 true） */
   simplify?: boolean;
-  /** 是否额外导出标准 `QF_BV` SMT-LIB2 文本（默认 false） */
+  /** 是否额外导出标准 `QF_BV` / `QF_UFBV` SMT-LIB2 文本（默认 false） */
   emitSmt2?: boolean;
   /** 可选初始寄存器具体值映射（如 `{ x0: 0x1234, x1: 0x5678 }`），用于启用寄存器参数的数值自校验 */
   initialRegs?: Record<string, number | bigint | string>;
@@ -1175,8 +1175,11 @@ interface TraceDecompileReport {
   readonly rawNodes: number;
   readonly simplifiedNodes: number;
   readonly originAnnotations: string[];
+  readonly outputLen: number;
   readonly expectedOutputHex?: string;
   readonly evaluatedOutputHex?: string;
+  readonly expectedOutputBytesHex?: string;
+  readonly evaluatedOutputBytesHex?: string;
   readonly verified: boolean | null;
   readonly cCode: string;
   readonly smt2: string | null;
@@ -1218,6 +1221,54 @@ interface TraceDiffTaintReport {
   readonly summaryText: string;
 }
 
+interface TraceArchivePackOptions {
+  /** 显式指定伴生 `.ext` 路径（省略则自动探测同级 `.ext`；与 `noExt: true` 互斥） */
+  extPath?: string;
+  /** 仅打包 `.idx` 忽略同级 `.ext`（默认 false） */
+  noExt?: boolean;
+  /** 可选模块加载基址（写入文件头供离线分析自动复用） */
+  baseAddr?: number | bigint | string;
+  /** 可选 UTF-8 备注文本 */
+  note?: string;
+  /** 压缩等级 `0..=9`（`0` 不压缩直接存储，默认 `6`） */
+  level?: number;
+}
+
+interface TraceArchiveInfo {
+  readonly version: number;
+  readonly hasExt: boolean;
+  readonly compressed: boolean;
+  readonly baseAddr: number;
+  readonly baseAddrHex: string;
+  readonly idxInsns: number;
+  readonly idxRawLen: number;
+  readonly idxCompLen: number;
+  readonly idxCrc32Hex: string;
+  readonly extEvents: number;
+  readonly extRawLen: number;
+  readonly extCompLen: number;
+  readonly extCrc32Hex: string;
+  readonly archiveFileLen: number;
+  readonly ratioPercent: number;
+  readonly recordedLevel: "fast" | "reg_delta" | "full" | null;
+  readonly note: string | null;
+  readonly summaryText: string;
+  readonly outPath?: string;
+}
+
+interface TraceArchiveUnpackOptions {
+  /** 可选输出文件名前缀（默认取 `.rtrace` 文件名主干） */
+  stem?: string;
+  /** 目标 `.idx`/`.ext` 已存在时是否允许覆盖（默认 false） */
+  overwrite?: boolean;
+}
+
+interface TraceArchiveUnpackResult {
+  readonly idxPath: string;
+  readonly extPath: string | null;
+  readonly info: TraceArchiveInfo;
+}
+
 interface TraceReaderHandle {
   readonly totalInsns: number;
   readonly totalExt: number;
@@ -1225,6 +1276,10 @@ interface TraceReaderHandle {
   readonly missingExtWarning: boolean;
   /** 录制级别（`"fast"` | `"reg_delta"` | `"full"` | `null`） */
   readonly recordedLevel: "fast" | "reg_delta" | "full" | null;
+  /** 是否打开自单文件压缩 `.rtrace` 归档 */
+  readonly isArchive: boolean;
+  /** 若 `.rtrace` 归档内记录了模块基址则给出十六进制地址，否则 `null` */
+  readonly archiveBaseAddrHex: string | null;
   /** 离线全知内存/值查询（内置替代手写 numpy 扫描 `.idx`/`.ext`） */
   query(opts: TraceQueryOptions): TraceQueryHit[];
   /** 值溯源便捷别名：查找所有写入过 `value` 的 guest 指令与 HLE 拷贝事件 */
@@ -1260,11 +1315,11 @@ interface TraceReaderHandle {
 }
 
 declare namespace Trace {
-  /** 打开离线 `trace.idx`（自动关联同目录同名 `.ext`，或手动传 `extPath`） */
-  function open(idxPath: string, extPath?: string): TraceReaderHandle;
-  /** 双跑 Trace 差分：定位首次控制流分歧与首次寄存器/内存/HLE 数据分歧 */
+  /** 打开离线 `trace.idx`（自动关联同目录同名 `.ext`，或手动传 `extPath`）或单文件压缩 `.rtrace` 归档 */
+  function open(idxPath: string, extPath?: string | null): TraceReaderHandle;
+  /** 双跑 Trace 差分（支持 `.idx` 与 `.rtrace`）：定位首次控制流分歧与首次寄存器/内存/HLE 数据分歧 */
   function diff(idxA: string, idxB: string, maxDiffs?: number): TraceDiffSummary;
-  /** 双跑差分 + 自动反向污点联动：比对目标缓冲区在两次运行中的差异字节段并分别反向溯源到起源寄存器/内存/HLE 熵源 */
+  /** 双跑差分 + 自动反向污点联动（支持 `.idx` 与 `.rtrace`）：比对目标缓冲区差异字节段并分别反向溯源 */
   function diffTaint(
     idxA: string,
     idxB: string,
@@ -1272,6 +1327,20 @@ declare namespace Trace {
     len?: number,
     maxInsns?: number
   ): TraceDiffTaintReport;
+  /** 将 `trace.idx`（及伴生 `.ext`）裁剪零填充并压缩打包为单文件 `.rtrace` 归档 */
+  function pack(
+    idxPath: string,
+    outPath?: string | null,
+    opts?: TraceArchivePackOptions
+  ): TraceArchiveInfo;
+  /** 快速查看 `.rtrace` 文件头与元信息（不解压指令载荷） */
+  function inspectArchive(rtracePath: string): TraceArchiveInfo;
+  /** 将 `.rtrace` 归档校验 CRC32 后解包还原为 `.idx`（及 `.ext`） */
+  function unpack(
+    rtracePath: string,
+    outDir?: string | null,
+    opts?: TraceArchiveUnpackOptions
+  ): TraceArchiveUnpackResult;
 }
 
 declare namespace Emu {

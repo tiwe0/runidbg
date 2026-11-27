@@ -7,11 +7,21 @@ use std::ptr;
 use memmap2::Mmap;
 
 use crate::error::EmuResult;
+use crate::tracer::archive::TraceArchive;
 use crate::tracer::record::{format_ext_record, ExtKind, ExtRecord, HleTraceEvent, TraceRecord};
 
 /// 按约定自动定位与 `trace.idx` 同目录伴生的 `.ext` 扩展流文件：
-/// 优先匹配替换扩展名后的 `<stem>.ext`，若不存在则回退 `<idx_path>.ext`（兼容非 `.idx` 后缀输出路径）。
+/// 若输入为 `.rtrace` 单文件归档则直接返回 `None`（优先使用归档内置 `.ext`）；
+/// 否则优先匹配替换扩展名后的 `<stem>.ext`，若不存在则回退 `<idx_path>.ext`。
 pub fn resolve_sibling_ext_path(idx_path: &Path) -> Option<PathBuf> {
+    if idx_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("rtrace"))
+        || TraceArchive::is_rtrace_file(idx_path)
+    {
+        return None;
+    }
     let replaced = idx_path.with_extension("ext");
     if replaced != idx_path && replaced.is_file() {
         return Some(replaced);
@@ -182,28 +192,75 @@ impl DiffTaintReport {
     }
 }
 
-/// 离线零拷贝 Trace 读取器（供 `runidbg-cli` 与离线分析脚本使用）
+/// Trace 底层只读字节存储：普通 `.idx`/`.ext` 零拷贝 mmap，单文件 `.rtrace` 解压到自有内存缓冲
+enum TraceBuffer {
+    Mmap(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for TraceBuffer {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mmap(m) => m,
+            Self::Owned(v) => v,
+        }
+    }
+}
+
+/// 离线零拷贝 Trace 读取器（同时透明支持 `.idx`/`.ext` 与单文件压缩 `.rtrace` 归档）
 pub struct TraceReader {
-    idx_mmap: Mmap,
+    idx_buf: TraceBuffer,
     idx_count: usize,
-    ext_mmap: Option<Mmap>,
+    ext_buf: Option<TraceBuffer>,
     ext_count: usize,
     ext_monotonic: bool,
     recorded_level_tag: u8,
     missing_ext: bool,
+    from_archive: bool,
+    archive_base_addr: Option<u64>,
+}
+
+fn map_file_or_empty(path: &Path) -> EmuResult<TraceBuffer> {
+    let file = File::open(path)?;
+    if file.metadata()?.len() == 0 {
+        return Ok(TraceBuffer::Owned(Vec::new()));
+    }
+    // SAFETY: 离线只读映射
+    Ok(TraceBuffer::Mmap(unsafe { Mmap::map(&file)? }))
 }
 
 impl TraceReader {
-    /// 打开 `trace.idx`（及可选的 `trace.ext`）
+    /// 打开 `trace.idx`（及可选 `trace.ext`）或单文件压缩 `.rtrace` 归档（按 `RTRC` 魔数自动识别）
     pub fn open(idx_path: impl AsRef<Path>, ext_path: Option<&Path>) -> EmuResult<Self> {
-        let idx_file = File::open(idx_path)?;
-        // SAFETY: 离线只读映射
-        let idx_mmap = unsafe { Mmap::map(&idx_file)? };
-        let total_idx_slots = idx_mmap.len() / size_of::<TraceRecord>();
+        let idx_path = idx_path.as_ref();
+        let (idx_buf, ext_buf, from_archive, archive_base_addr) =
+            if TraceArchive::is_rtrace_file(idx_path) {
+                let (idx_bytes, ext_bytes_opt, info) = TraceArchive::load_buffers(idx_path)?;
+                // 若调用方显式指定了外部 ext_path，则允许其覆盖归档内置 .ext（并严格校验文件可读）
+                let ext_buf = if let Some(ep) = ext_path {
+                    Some(map_file_or_empty(ep)?)
+                } else {
+                    ext_bytes_opt.map(TraceBuffer::Owned)
+                };
+                let base_opt = (info.base_addr != 0).then_some(info.base_addr);
+                (TraceBuffer::Owned(idx_bytes), ext_buf, true, base_opt)
+            } else {
+                let idx_buf = map_file_or_empty(idx_path)?;
+                let ext_buf = match ext_path {
+                    Some(ep) => Some(map_file_or_empty(ep)?),
+                    None => None,
+                };
+                (idx_buf, ext_buf, false, None)
+            };
+
+        let total_idx_slots = idx_buf.len() / size_of::<TraceRecord>();
 
         let mut idx_count = 0usize;
         for i in 0..total_idx_slots {
-            let rec = read_packed::<TraceRecord>(&idx_mmap, i);
+            let rec = read_packed::<TraceRecord>(&idx_buf, i);
             let pc = rec.pc;
             let op = rec.opcode;
             if pc == 0 && op == 0 {
@@ -212,15 +269,13 @@ impl TraceReader {
             idx_count += 1;
         }
 
-        let (ext_mmap, ext_count, ext_monotonic) = if let Some(ep) = ext_path {
-            let ext_file = File::open(ep)?;
-            let mmap = unsafe { Mmap::map(&ext_file)? };
-            let total_ext_slots = mmap.len() / size_of::<ExtRecord>();
+        let (ext_count, ext_monotonic) = if let Some(ref eb) = ext_buf {
+            let total_ext_slots = eb.len() / size_of::<ExtRecord>();
             let mut count = 0usize;
             let mut monotonic = true;
             let mut prev_seq = 0u32;
             for i in 0..total_ext_slots {
-                let rec = read_packed::<ExtRecord>(&mmap, i);
+                let rec = read_packed::<ExtRecord>(eb, i);
                 if rec.kind == 0 {
                     break;
                 }
@@ -231,31 +286,48 @@ impl TraceReader {
                 prev_seq = seq;
                 count += 1;
             }
-            (Some(mmap), count, monotonic)
+            (count, monotonic)
         } else {
-            (None, 0, true)
+            (0, true)
         };
 
         let recorded_level_tag = if idx_count > 0 {
-            read_packed::<TraceRecord>(&idx_mmap, 0)._reserved[1]
+            read_packed::<TraceRecord>(&idx_buf, 0)._reserved[1]
         } else {
             0
         };
-        let has_any_ext_flag = ext_mmap.is_none()
+        let has_any_ext_flag = ext_buf.is_none()
             && matches!(recorded_level_tag, 0 | 3)
             && (0..idx_count.min(4096))
-                .any(|i| (read_packed::<TraceRecord>(&idx_mmap, i)._reserved[0] & 1) != 0);
-        let missing_ext = ext_mmap.is_none() && (recorded_level_tag == 3 || has_any_ext_flag);
+                .any(|i| (read_packed::<TraceRecord>(&idx_buf, i)._reserved[0] & 1) != 0);
+        let missing_ext = ext_buf.is_none() && (recorded_level_tag == 3 || has_any_ext_flag);
 
         Ok(Self {
-            idx_mmap,
+            idx_buf,
             idx_count,
-            ext_mmap,
+            ext_buf,
             ext_count,
             ext_monotonic,
             recorded_level_tag,
             missing_ext,
+            from_archive,
+            archive_base_addr,
         })
+    }
+
+    /// 是否已加载 `.ext` 扩展流（包括外部 `.ext` 文件或 `.rtrace` 归档内嵌 `.ext`）
+    pub const fn has_ext(&self) -> bool {
+        self.ext_buf.is_some()
+    }
+
+    /// 是否来自单文件 `.rtrace` 压缩归档
+    pub const fn is_archive(&self) -> bool {
+        self.from_archive
+    }
+
+    /// 若打开的是打包时记录了 `--base` 的 `.rtrace` 归档，返回其保存的模块基址
+    pub const fn archive_base_addr(&self) -> Option<u64> {
+        self.archive_base_addr
     }
 
     /// 若 `.idx` 录制于 `Full` 级别（或带扩展流标记）但未加载到伴生 `.ext` 文件，返回 `true`
@@ -287,16 +359,16 @@ impl TraceReader {
 
     pub fn get(&self, index: usize) -> Option<TraceRecord> {
         if index < self.idx_count {
-            Some(read_packed::<TraceRecord>(&self.idx_mmap, index))
+            Some(read_packed::<TraceRecord>(&self.idx_buf, index))
         } else {
             None
         }
     }
 
     pub fn get_ext(&self, index: usize) -> Option<ExtRecord> {
-        let mmap = self.ext_mmap.as_ref()?;
+        let buf = self.ext_buf.as_ref()?;
         if index < self.ext_count {
-            Some(read_packed::<ExtRecord>(mmap, index))
+            Some(read_packed::<ExtRecord>(buf, index))
         } else {
             None
         }
@@ -304,7 +376,7 @@ impl TraceReader {
 
     /// 按指令序号查找所有关联的扩展事件（单调序列自动走二分查找）
     pub fn ext_for_seq(&self, seq_low32: u32) -> Vec<ExtRecord> {
-        let Some(mmap) = self.ext_mmap.as_ref() else {
+        let Some(mmap) = self.ext_buf.as_ref() else {
             return Vec::new();
         };
         if self.ext_count == 0 {
@@ -495,7 +567,7 @@ impl TraceReader {
 
     /// 枚举 `trace.ext` 中全部结构化 HLE 内存/分配事件（`memcpy`/`memmove`/`memset`/`malloc`/`free`）
     pub fn hle_events(&self) -> Vec<HleTraceEvent> {
-        let Some(mmap) = self.ext_mmap.as_ref() else {
+        let Some(mmap) = self.ext_buf.as_ref() else {
             return Vec::new();
         };
         let mut raw = Vec::new();
@@ -544,7 +616,7 @@ impl TraceReader {
     pub fn search_value(&self, target: u64) -> Vec<(usize, TraceRecord)> {
         let mut hits = Vec::new();
         for i in 0..self.idx_count {
-            let rec = read_packed::<TraceRecord>(&self.idx_mmap, i);
+            let rec = read_packed::<TraceRecord>(&self.idx_buf, i);
             let reg_id = rec.primary_reg_id;
             let reg_val = rec.primary_reg_val;
             if reg_id != 0xFF && reg_val == target {
@@ -560,7 +632,7 @@ impl TraceReader {
         let mut seq_to_idx: Option<HashMap<u32, usize>> = None;
 
         for i in 0..self.idx_count {
-            let rec = read_packed::<TraceRecord>(&self.idx_mmap, i);
+            let rec = read_packed::<TraceRecord>(&self.idx_buf, i);
             let reg_id = rec.primary_reg_id;
             let reg_val = rec.primary_reg_val;
             if reg_id != 0xFF && reg_val == target {
@@ -569,7 +641,7 @@ impl TraceReader {
             }
         }
 
-        if let Some(mmap) = self.ext_mmap.as_ref() {
+        if let Some(mmap) = self.ext_buf.as_ref() {
             for i in 0..self.ext_count {
                 let ext = read_packed::<ExtRecord>(mmap, i);
                 if ext.kind == ExtKind::RegDeltaExtra as u8 && ext.value == target {
@@ -591,7 +663,7 @@ impl TraceReader {
 
     /// 搜索扩展流中读写值匹配 `target` 的内存事件
     pub fn search_mem_value(&self, target: u64) -> Vec<ExtRecord> {
-        let Some(mmap) = self.ext_mmap.as_ref() else {
+        let Some(mmap) = self.ext_buf.as_ref() else {
             return Vec::new();
         };
         let mut hits = Vec::new();
@@ -609,7 +681,7 @@ impl TraceReader {
 
     /// 返回第一个 `seq_low32 > at_seq`（或回绕纪元边界）的扩展流上界索引
     fn ext_end_index_for_seq(&self, at_seq: u32) -> usize {
-        let Some(mmap) = self.ext_mmap.as_ref() else {
+        let Some(mmap) = self.ext_buf.as_ref() else {
             return 0;
         };
         if self.ext_count == 0 {
@@ -647,7 +719,7 @@ impl TraceReader {
 
     /// 搜索扩展流中访问了目标内存地址的事件（同时覆盖 Guest 指令访存与 HLE 区间拷贝/填充/分配）
     pub fn search_mem_addr(&self, target_addr: u64) -> Vec<ExtRecord> {
-        let Some(mmap) = self.ext_mmap.as_ref() else {
+        let Some(mmap) = self.ext_buf.as_ref() else {
             return Vec::new();
         };
         let mut hits = Vec::new();
@@ -719,7 +791,7 @@ impl TraceReader {
         if pattern.is_empty() {
             return Vec::new();
         }
-        let Some(mmap) = self.ext_mmap.as_ref() else {
+        let Some(mmap) = self.ext_buf.as_ref() else {
             return Vec::new();
         };
         let end_idx = max_seq
@@ -984,7 +1056,7 @@ impl TraceReader {
         include_hle: bool,
         limit: usize,
     ) -> Vec<TraceQueryHit> {
-        let Some(mmap) = self.ext_mmap.as_ref() else {
+        let Some(mmap) = self.ext_buf.as_ref() else {
             return Vec::new();
         };
         let q_len = len.max(1);
@@ -1124,7 +1196,7 @@ impl TraceReader {
     /// 重建任意时刻 `at_seq` 时内存区间 `[addr, addr + len)` 的最近写入字节快照（逆向 O(len) 内存、无 1MiB 截断、全部槽位解出即早停）
     pub fn reconstruct_mem_at(&self, addr: u64, len: usize, at_seq: u32) -> Vec<Option<u8>> {
         let mut out = vec![None; len];
-        let Some(mmap) = self.ext_mmap.as_ref() else {
+        let Some(mmap) = self.ext_buf.as_ref() else {
             return out;
         };
         if len == 0 {
@@ -1274,8 +1346,8 @@ impl TraceReader {
         let mut first_data_divergence_idx = None;
 
         for idx in 0..min_len {
-            let ra = read_packed::<TraceRecord>(&a.idx_mmap, idx);
-            let rb = read_packed::<TraceRecord>(&b.idx_mmap, idx);
+            let ra = read_packed::<TraceRecord>(&a.idx_buf, idx);
+            let rb = read_packed::<TraceRecord>(&b.idx_buf, idx);
             let pc_a = ra.pc;
             let pc_b = rb.pc;
             let op_a = ra.opcode;
@@ -1530,7 +1602,7 @@ impl TraceReader {
         }
 
         // 根节点代表整个 Trace 入口函数
-        let root_pc = read_packed::<TraceRecord>(&self.idx_mmap, 0).pc;
+        let root_pc = read_packed::<TraceRecord>(&self.idx_buf, 0).pc;
         nodes.push(CallTreeNode {
             target_pc: root_pc,
             caller_pc: 0,
@@ -1540,8 +1612,8 @@ impl TraceReader {
         });
 
         for idx in 0..total.saturating_sub(1) {
-            let cur = read_packed::<TraceRecord>(&self.idx_mmap, idx);
-            let next = read_packed::<TraceRecord>(&self.idx_mmap, idx + 1);
+            let cur = read_packed::<TraceRecord>(&self.idx_buf, idx);
+            let next = read_packed::<TraceRecord>(&self.idx_buf, idx + 1);
             let pc = cur.pc;
             let op = cur.opcode;
             let next_pc = next.pc;
@@ -1673,7 +1745,7 @@ impl TraceReader {
         let mut raw_hits: BTreeMap<&'static str, Vec<(usize, u64, u32)>> = BTreeMap::new();
 
         for i in 0..self.idx_count {
-            let rec = read_packed::<TraceRecord>(&self.idx_mmap, i);
+            let rec = read_packed::<TraceRecord>(&self.idx_buf, i);
             let op = rec.opcode;
             // 检测 ARMv8 硬件 AES 指令（AESE / AESD / AESMC / AESIMC）
             if matches!(
@@ -1713,7 +1785,7 @@ impl TraceReader {
         }
 
         let mut direct_groups: Vec<CryptoHitGroup> = Vec::new();
-        if let Some(mmap) = self.ext_mmap.as_ref() {
+        if let Some(mmap) = self.ext_buf.as_ref() {
             const AES_SBOX_HEAD: [u8; 16] = [
                 0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe,
                 0xd7, 0xab, 0x76,
@@ -1936,7 +2008,7 @@ impl TraceReader {
         start_idx: usize,
         end_idx: usize,
     ) -> (Vec<(u64, usize)>, Vec<(u64, usize)>) {
-        if self.ext_mmap.is_none() || self.idx_count == 0 {
+        if self.ext_buf.is_none() || self.idx_count == 0 {
             return (Vec::new(), Vec::new());
         }
         let s_idx = start_idx.saturating_sub(128);
@@ -1949,7 +2021,7 @@ impl TraceReader {
         };
         let min_seq = rec_s.seq_low32;
         let max_seq = rec_e.seq_low32;
-        let Some(mmap) = self.ext_mmap.as_ref() else {
+        let Some(mmap) = self.ext_buf.as_ref() else {
             return (Vec::new(), Vec::new());
         };
         let ext_end = self.ext_end_index_for_seq(max_seq);
@@ -2019,7 +2091,7 @@ impl TraceReader {
     fn build_seq_index_map(&self) -> HashMap<u32, usize> {
         let mut map = HashMap::with_capacity(self.idx_count);
         for i in 0..self.idx_count {
-            let seq = read_packed::<TraceRecord>(&self.idx_mmap, i).seq_low32;
+            let seq = read_packed::<TraceRecord>(&self.idx_buf, i).seq_low32;
             map.insert(seq, i);
         }
         map
@@ -2072,7 +2144,7 @@ impl TraceReader {
     fn collect_relative_offsets(&self, runtime_base: u64) -> BTreeSet<u64> {
         let mut offsets = BTreeSet::new();
         for i in 0..self.idx_count {
-            let pc = read_packed::<TraceRecord>(&self.idx_mmap, i).pc;
+            let pc = read_packed::<TraceRecord>(&self.idx_buf, i).pc;
             if pc >= runtime_base {
                 offsets.insert(pc - runtime_base);
             }
@@ -2100,8 +2172,14 @@ fn range_overlaps_u128(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bo
 }
 
 #[inline]
-fn read_packed<T: Copy>(mmap: &Mmap, index: usize) -> T {
-    let offset = index * size_of::<T>();
-    // SAFETY: 调用方保证 index * size_of::<T>() + size_of::<T>() <= mmap.len()
-    unsafe { ptr::read_unaligned(mmap.as_ptr().add(offset) as *const T) }
+fn read_packed<T: Copy>(buf: &[u8], index: usize) -> T {
+    let offset = index
+        .checked_mul(size_of::<T>())
+        .expect("trace record index overflow");
+    let end = offset
+        .checked_add(size_of::<T>())
+        .expect("trace record offset overflow");
+    assert!(end <= buf.len(), "trace record read out of bounds");
+    // SAFETY: 已在 release 与 debug 模式下显式校验 end <= buf.len()
+    unsafe { ptr::read_unaligned(buf.as_ptr().add(offset) as *const T) }
 }

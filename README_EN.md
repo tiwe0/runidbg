@@ -7,10 +7,10 @@
 `Rust + unidbg + ... = runidbg`
 
 <p>
-  <a href="https://github.com/tiwe0/runidbg/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.5-FF6B2C?style=flat-square" alt="Release v0.4.5" /></a>
+  <a href="https://github.com/tiwe0/runidbg/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.6-FF6B2C?style=flat-square" alt="Release v0.4.6" /></a>
   <img src="https://img.shields.io/badge/Rust-2021-E6522C?style=flat-square&logo=rust&logoColor=white" alt="Rust 2021" />
   <img src="https://img.shields.io/badge/Target-Android%20ARM64-34D399?style=flat-square&logo=android&logoColor=white" alt="Android ARM64" />
-  <img src="https://img.shields.io/badge/Tests-135%2F135%20passing-10B981?style=flat-square" alt="Tests 135/135" />
+  <img src="https://img.shields.io/badge/Tests-148%2F148%20passing-10B981?style=flat-square" alt="Tests 148/148" />
   <img src="https://img.shields.io/badge/License-MIT-64748B?style=flat-square" alt="MIT License" />
 </p>
 
@@ -39,7 +39,7 @@
 - **Pure-Rust Zero-JVM Speed** — `77 ms` cold start (`22.6×`), `21.7 MB` single-worker RSS (`-82%` RAM), shipped as a single binary.
 - **4 Pluggable ARM64 Backends** — Switch cleanly between `Unicorn 2.1` (full Trace / Hook / GDB) and `Dynarmic JIT` / `Linux KVM` / `macOS Hypervisor` (up to `480×` compute speedup).
 - **Complete Android Native Runtime** — Full ELF dynamic linker, `110+` HLE stubs, coalescing free-list heap, JNI 1.6, in-memory APK loader, `DeviceProfile` presets, isolated dual-stream RNG & offline-safe Socket/epoll.
-- **Zero-Copy Tracer, Lightweight Taint & Slice-to-C Decompiler** — `17.03M insns/s` dual-stream `.idx/.ext` (unifying HLE memory/entropy/clock events with missing-`.ext` warnings), pure-Rust byte-granular forward/backward taint slicing (`--from-seq` / `--stop-at-pc` / `--stop-mem` surgical cutoffs & `[ORIGIN: HLE rand()/gettimeofday()]` tagging), **single-path symbolic lifting → algebraic / ROTR / S-Box / OLLVM MBA / byte-reassembly simplification + `--fold-rodata` + `UMULH`/`SMULH` magic-division recovery → self-verified compilable pseudo-C & SMT-LIB2**, SIMD scanning (`22.95 GB/s`), omniscient queries, `mem` reconstruction & dual-run diff-taint linkage (`diff --target-addr`).
+- **Zero-Copy Tracer, Single-File `.rtrace`, Lightweight Taint & `decompile` v2** — `17.03M insns/s` dual-stream `.idx/.ext` (unifying HLE memory/entropy/clock events with missing-`.ext` warnings) plus **`pack`/`unpack` single-file Deflate-compressed `.rtrace` archives transparently readable by every offline CLI/UI/JS/MCP command without unpacking**; pure-Rust byte-granular forward/backward taint slicing (`--from-seq` / `--stop-at-pc` / `--stop-mem` surgical cutoffs & `[ORIGIN: HLE rand()/gettimeofday()]` tagging); **`decompile` v2 with 1..64B multi-output joint buffer decompilation (cross-output shared CSE), readable `LOAD16/32/64_LE` folding, 128-bit NEON lane lifting & ARMv8-CE hardware AES (`AESE`/`AESD`/`AESMC`/`AESIMC`) → self-verified compilable pseudo-C & `QF_BV`/`QF_UFBV` SMT-LIB2**; SIMD scanning (`22.95 GB/s`), omniscient queries, `mem` reconstruction & dual-run diff-taint linkage (`diff --target-addr`).
 - **Built-In `good64` Zero-Dep ARM64 Assembler & Relocator** — Covers 99% of practical Android ARM64 instructions (bitfields, LSE atomics, sysregs, PAC/BTI, scalar FP, 128-bit NEON & AES), with 4B/16B/20B Inline Hook trampolines and multi-pass PC-relative instruction relocation as a lightweight pure-Rust Keystone replacement.
 - **OLLVM & Bytecode VM Assistant** — Auto-detects dispatch loops, 4B/8B jump tables, bytecode PCs, handler distributions & relocated regfile diffs (with `--seq-range` windowing), paired with live `watchRegfile` and word decoding.
 - **`.rtape` Time-Travel Debugging** — Sparse 4KB dirty-page checkpoints & 4-backend relay (fast boot on Hyper/Dynarmic → record on Unicorn), bit-exact JS-free replay & reverse GDB watchpoints.
@@ -70,8 +70,9 @@ runidbg-cli run       sign.js                                      # Run script
 runidbg-cli serve     sign.js --workers auto --allow-reload        # Start multi-core RPC server
 runidbg-cli asm       "paciasp; ubfx x0, x1, #4, #8; ret"          # Built-in good64 ARM64 assembler
 runidbg-cli taint     trace.idx --mode backward --addr 0x50006470 --from-seq 1000  # Offline taint / diff / vm
-runidbg-cli decompile trace.idx --addr 0x50006470 --len 8 --fold-rodata --smt2     # Slice -> verified pseudo-C
-runidbg-cli mem       trace.idx --addr 0x50006170 --len 576 --at 1820000           # Reconstruct memory at any seq
+runidbg-cli decompile trace.rtrace --addr 0x50006470 --len 16 --fold-rodata --smt2 # 16B multi-out / NEON / AES -> pseudo-C
+runidbg-cli pack      trace.idx --base 0x40000000 --out trace.rtrace               # Trim zero-pad & pack single-file .rtrace
+runidbg-cli mem       trace.rtrace --addr 0x50006170 --len 576 --at 1820000        # Reconstruct memory at any seq
 runidbg-cli ui        session.rtape --open                                         # Dark Web UI Time-Travel Cockpit
 runidbg-cli mcp       --cwd .                                                      # Launch MCP server (39 tools)
 ```
@@ -105,7 +106,7 @@ runidbg-cli mcp       --cwd .                                                   
 
 ## Contributing & Acknowledgements
 
-Incompatible Android ARM64 `.so` samples (with credentials redacted) and minimal reproduction scripts are warmly welcomed via Issues & PRs. Run `cargo test` to execute the full test suite (`135` tests on macOS ARM64; `134` on Linux/Windows).
+Incompatible Android ARM64 `.so` samples (with credentials redacted) and minimal reproduction scripts are warmly welcomed via Issues & PRs. Run `cargo test` to execute the full test suite (`148` tests on macOS ARM64; `147` on Linux/Windows).
 
 Special thanks to [**unidbg**](https://github.com/zhkl0228/unidbg) (`zhkl0228`) for pioneering hand-crafted Android/iOS emulation in the pre-AI era, as well as [Unicorn Engine](https://github.com/unicorn-engine/unicorn), [Dynarmic](https://github.com/merryhime/dynarmic), [QuickJS](https://bellard.org/quickjs/) / `rquickjs`, `goblin`, and `bad64`.
 

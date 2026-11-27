@@ -7,10 +7,10 @@
 `Rust + unidbg + ... = runidbg`
 
 <p>
-  <a href="https://github.com/tiwe0/runidbg/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.5-FF6B2C?style=flat-square" alt="Release v0.4.5" /></a>
+  <a href="https://github.com/tiwe0/runidbg/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.6-FF6B2C?style=flat-square" alt="Release v0.4.6" /></a>
   <img src="https://img.shields.io/badge/Rust-2021-E6522C?style=flat-square&logo=rust&logoColor=white" alt="Rust 2021" />
   <img src="https://img.shields.io/badge/Target-Android%20ARM64-34D399?style=flat-square&logo=android&logoColor=white" alt="Android ARM64" />
-  <img src="https://img.shields.io/badge/Tests-135%2F135%20passing-10B981?style=flat-square" alt="Tests 135/135" />
+  <img src="https://img.shields.io/badge/Tests-148%2F148%20passing-10B981?style=flat-square" alt="Tests 148/148" />
   <img src="https://img.shields.io/badge/License-MIT-64748B?style=flat-square" alt="MIT License" />
 </p>
 
@@ -39,7 +39,7 @@
 - **纯 Rust 零 JVM 高性能** — `77 ms` 冷启动（`22.6×`）、`21.7 MB` 单实例内存（省 `82%`），单文件跨平台分发。
 - **四引擎 ARM64 后端** — `Unicorn 2.1`（全功能 Trace / Hook / GDB）与 `Dynarmic JIT` / `Linux KVM` / `macOS Hypervisor`（纯算最高 `480×`）统一接口切换。
 - **完整 Android 原生运行时** — ELF 动态链接、`110+` HLE、合并空闲链堆、JNI 1.6、APK 内存直载、`DeviceProfile` 真机画像、隔离双流 RNG 与离线护栏 Socket/epoll。
-- **零拷贝 Tracer、轻量污点与精简伪 C 反编译** — `17.03M insns/s` 双流 `.idx/.ext`（统一记录 HLE 内存/熵源/时钟事件 + 缺失 `.ext` 显式告警）、纯 Rust 字节级前向/反向污点切片（支持 `--from-seq` / `--stop-at-pc` / `--stop-mem` 手术刀截断与熵源溯源标注）、**单路径符号提升 → 代数/ROTR/S-Box/OLLVM MBA/字节重装化简 + `--fold-rodata` + `UMULH`/`SMULH` 魔数除法反推 → 自校验可编译伪 C & SMT-LIB2**、SIMD 内存扫描（`22.95 GB/s`）、全知查询、内存重建（`mem`）与双跑差分污点联动（`diff --target-addr`）。
+- **零拷贝 Tracer、单文件 `.rtrace`、轻量污点与 `decompile` v2** — `17.03M insns/s` 双流 `.idx/.ext`（统一记录 HLE 内存/熵源/时钟事件 + 缺失 `.ext` 显式告警），支持 **`pack`/`unpack` 打包单文件 Deflate 压缩 `.rtrace` 归档（全离线命令/UI/JS/MCP 透明免解包直读）**；纯 Rust 字节级前向/反向污点切片（`--from-seq` / `--stop-at-pc` / `--stop-mem` 手术刀截断与熵源标注）；**`decompile` v2 支持 1..64B 缓冲区多输出联合反编译（跨输出共享 CSE）、`LOAD16/32/64_LE` 可读折叠、NEON 128-bit 通道级提升与 ARMv8-CE 硬件 AES（`AESE`/`AESD`/`AESMC`/`AESIMC`）→ 自校验可编译伪 C & `QF_BV`/`QF_UFBV` SMT-LIB2**；SIMD 内存扫描（`22.95 GB/s`）、全知查询、内存重建（`mem`）与双跑差分污点联动（`diff --target-addr`）。
 - **内置 `good64` 零依赖 ARM64 汇编器与重定位器** — 覆盖 99% Android ARM64 指令（含位域、LSE 原子、系统寄存器、PAC/BTI、标量 FP、128-bit NEON & AES），内置 4B/16B/20B Inline Hook 跳板与多遍 PC 相对指令重定位器，无缝替代 Keystone。
 - **OLLVM / 字节码 VM 助手** — 自动识别 Dispatch Loop、4B/8B 跳转表、字节码 PC、Handler 分布与基址搬家差分（支持 `--seq-range` 窗口聚焦），配合在线 `watchRegfile` 与指令字解码。
 - **`.rtape` 磁带与时间旅行** — 4KB 稀疏脏页增量与四引擎跨后端接力（Hyper/Dynarmic 极速初始化 → Unicorn 精录），支持 100% 比特级离线重放与 GDB 反向观察点。
@@ -70,8 +70,9 @@ runidbg-cli run       sign.js                                      # 执行脚�
 runidbg-cli serve     sign.js --workers auto --allow-reload        # 启动多核 RPC 服务
 runidbg-cli asm       "paciasp; ubfx x0, x1, #4, #8; ret"          # 内置 good64 ARM64 汇编器
 runidbg-cli taint     trace.idx --mode backward --addr 0x50006470 --from-seq 1000  # 离线污点 / diff / vm
-runidbg-cli decompile trace.idx --addr 0x50006470 --len 8 --fold-rodata --smt2     # 切片 -> 自校验精简伪 C
-runidbg-cli mem       trace.idx --addr 0x50006170 --len 576 --at 1820000           # 任意时刻内存快照重建
+runidbg-cli decompile trace.rtrace --addr 0x50006470 --len 16 --fold-rodata --smt2 # 16B 多输出/NEON/AES -> 自校验伪 C
+runidbg-cli pack      trace.idx --base 0x40000000 --out trace.rtrace               # 裁剪零填充并压缩为单文件 .rtrace
+runidbg-cli mem       trace.rtrace --addr 0x50006170 --len 576 --at 1820000        # 任意时刻内存快照重建
 runidbg-cli ui        session.rtape --open                                         # 暗黑 Web UI 时间旅行驾驶舱
 runidbg-cli mcp       --cwd .                                                      # 启动 MCP 服务端（39 工具）
 ```
@@ -105,7 +106,7 @@ runidbg-cli mcp       --cwd .                                                   
 
 ## Contributing & Acknowledgements
 
-欢迎通过 Issue / PR 提交脱敏后的不兼容 Android ARM64 `.so` 样本与最小复现脚本；本地校验请运行 `cargo test`（macOS ARM64 共 135 项测试，Linux/Windows 共 134 项）。
+欢迎通过 Issue / PR 提交脱敏后的不兼容 Android ARM64 `.so` 样本与最小复现脚本；本地校验请运行 `cargo test`（macOS ARM64 共 148 项测试，Linux/Windows 共 147 项）。
 
 特别致谢 [**unidbg**](https://github.com/zhkl0228/unidbg) 及其作者 `zhkl0228`——在没有 AI 辅助的年代凭一己之力手写并持续维护横跨 Android 与 iOS 的仿真框架令人由衷钦佩；同时感谢 [Unicorn Engine](https://github.com/unicorn-engine/unicorn)、[Dynarmic](https://github.com/merryhime/dynarmic)、[QuickJS](https://bellard.org/quickjs/) / `rquickjs`、`goblin`、`bad64` 等优秀开源项目。
 

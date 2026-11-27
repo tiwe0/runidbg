@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod decompile;
 pub mod engine;
 pub mod reader;
@@ -5,6 +6,10 @@ pub mod record;
 pub mod taint;
 pub mod vm;
 
+pub use archive::{
+    TraceArchive, TraceArchiveInfo, TraceArchivePackOptions, TraceArchiveUnpackResult,
+    RTRACE_MAGIC, RTRACE_VERSION,
+};
 pub use decompile::{DecompileOptions, DecompileReport, DecompiledInput, DecompiledTable};
 
 pub use engine::{attach_code_hook, attach_mem_trace_hook, BinaryTracer};

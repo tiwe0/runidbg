@@ -1,6 +1,6 @@
 [package]
 name = "runidbg-arm64-emu-tracer"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 authors = ["Ivory"]
 license = "MIT"

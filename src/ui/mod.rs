@@ -97,11 +97,24 @@ pub fn start_trace_ui_server(
     listen_addr: &str,
 ) -> Result<TraceUiHandle> {
     let reader = TraceReader::open(idx_path, ext_path)?;
+    if reader.missing_ext_warning() {
+        let lvl = reader.recorded_level_name().unwrap_or("full");
+        eprintln!(
+            "WARN: {} 录制于 {lvl} 级别但未加载到伴生 .ext 文件（扩展事件=0）；请确认同级 .ext 未遗漏或通过 --ext 指定路径",
+            idx_path.display()
+        );
+    }
+    let effective_base = if base_addr != 0 {
+        base_addr
+    } else {
+        reader.archive_base_addr().unwrap_or(0)
+    };
+    let has_ext = reader.has_ext();
     let state = Arc::new(TraceUiState {
         reader,
         trace_path: idx_path.display().to_string(),
-        has_ext: ext_path.is_some(),
-        base_addr,
+        has_ext,
+        base_addr: effective_base,
     });
 
     let listen = listen_addr.to_string();

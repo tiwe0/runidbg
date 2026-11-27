@@ -1477,11 +1477,34 @@
     },
   };
 
+  function requireNonEmptyPath(val, label) {
+    if (typeof val !== "string" || val.trim().length === 0) {
+      throw new TypeError(label + " 必须为非空字符串路径");
+    }
+    return val;
+  }
+
+  function optionalPathArg(val, label) {
+    if (val === undefined || val === null) return null;
+    if (typeof val !== "string" || val.trim().length === 0) {
+      throw new TypeError(label + " 必须为非空字符串路径或 null/undefined");
+    }
+    return val;
+  }
+
+  function requirePlainOpts(val, label) {
+    if (val === undefined || val === null) return {};
+    if (typeof val !== "object" || Array.isArray(val)) {
+      throw new TypeError(label + " 必须为普通配置对象");
+    }
+    return val;
+  }
+
   global.Trace = {
     open(idxPath, extPath) {
       const info = __native.traceOpen(
-        String(idxPath),
-        extPath !== undefined && extPath !== null ? String(extPath) : null
+        requireNonEmptyPath(idxPath, "Trace.open(idxPath)"),
+        optionalPathArg(extPath, "Trace.open(extPath)")
       );
       const traceId = info.traceId;
       return {
@@ -1489,6 +1512,8 @@
         totalExt: info.totalExt,
         missingExtWarning: Boolean(info.missingExtWarning),
         recordedLevel: info.recordedLevel || null,
+        isArchive: Boolean(info.isArchive),
+        archiveBaseAddrHex: info.archiveBaseAddrHex || null,
         query(opts) {
           return __native.traceQuery(traceId, opts || {});
         },
@@ -1557,6 +1582,25 @@
         addr,
         len,
         maxInsns
+      );
+    },
+    pack(idxPath, outPath, opts) {
+      return __native.tracePack(
+        requireNonEmptyPath(idxPath, "Trace.pack(idxPath)"),
+        optionalPathArg(outPath, "Trace.pack(outPath)"),
+        requirePlainOpts(opts, "Trace.pack(opts)")
+      );
+    },
+    inspectArchive(rtracePath) {
+      return __native.traceInspectArchive(
+        requireNonEmptyPath(rtracePath, "Trace.inspectArchive(rtracePath)")
+      );
+    },
+    unpack(rtracePath, outDir, opts) {
+      return __native.traceUnpack(
+        requireNonEmptyPath(rtracePath, "Trace.unpack(rtracePath)"),
+        optionalPathArg(outDir, "Trace.unpack(outDir)"),
+        requirePlainOpts(opts, "Trace.unpack(opts)")
       );
     },
   };

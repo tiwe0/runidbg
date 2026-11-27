@@ -708,6 +708,26 @@ where
                 }
             }
             let is_write = matches!(mem_type, MemType::WRITE);
+            if !is_write && size > 8 {
+                // Unicorn 偶发单次 16B 读回调时拆分为多条 8B 记录，避免丢失高 8 字节样本；读取失败则中止避免写入假 0
+                let capped = size.min(64);
+                let mut off = 0usize;
+                while off < capped {
+                    let chunk = (capped - off).min(8);
+                    let mut buf = [0u8; 8];
+                    if uc
+                        .mem_read(addr.wrapping_add(off as u64), &mut buf[..chunk])
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let val = u64::from_le_bytes(buf);
+                    let tracer = get_tracer(uc.get_data_mut());
+                    tracer.record_mem_access(false, addr.wrapping_add(off as u64), chunk, val);
+                    off += chunk;
+                }
+                return true;
+            }
             let mask = match size {
                 1 => 0xFFu64,
                 2 => 0xFFFFu64,

@@ -312,7 +312,7 @@ impl McpServer {
                 let idx_path = Path::new(idx_path_str);
                 let ext_path = resolve_ext_path(idx_path, args.get("extPath").and_then(Value::as_str));
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("dump");
-                let base_addr = args
+                let mut base_addr = args
                     .get("base")
                     .map(|v| parse_addr_val(Some(v)))
                     .transpose()?
@@ -320,6 +320,9 @@ impl McpServer {
                 let skip = args.get("skip").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
                 let reader = TraceReader::open(idx_path, ext_path.as_deref())?;
+                if base_addr == 0 {
+                    base_addr = reader.archive_base_addr().unwrap_or(0);
+                }
 
                 let fmt_rel = |pc: u64| -> String {
                     if base_addr != 0 && pc >= base_addr {
@@ -418,7 +421,7 @@ impl McpServer {
                                     let hint = format_ascii_hint(reg_val, 8).unwrap_or_default();
                                     lines.push(format!("    [REG] {name} <- 0x{reg_val:016x}{hint}"));
                                 }
-                                if ext_path.is_some() {
+                                if reader.has_ext() {
                                     for line in reader.mem_and_hle_lines_for(idx) {
                                         lines.push(line);
                                     }
@@ -442,7 +445,7 @@ impl McpServer {
             }
             "trace_calltree" => {
                 let idx_path_str = req_str(args, "idxPath")?;
-                let base_addr = args
+                let mut base_addr = args
                     .get("base")
                     .map(|v| parse_addr_val(Some(v)))
                     .transpose()?
@@ -451,6 +454,9 @@ impl McpServer {
                 let min_insns = args.get("minInsns").and_then(Value::as_u64).unwrap_or(1000) as usize;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
                 let reader = TraceReader::open(Path::new(idx_path_str), None)?;
+                if base_addr == 0 {
+                    base_addr = reader.archive_base_addr().unwrap_or(0);
+                }
                 let total = reader.len().max(1);
                 let all_nodes = reader.build_calltree();
                 let nodes: Vec<Value> = all_nodes
@@ -490,12 +496,15 @@ impl McpServer {
                 let idx_path_str = req_str(args, "idxPath")?;
                 let idx_path = Path::new(idx_path_str);
                 let ext_path = resolve_ext_path(idx_path, args.get("extPath").and_then(Value::as_str));
-                let base_addr = args
+                let mut base_addr = args
                     .get("base")
                     .map(|v| parse_addr_val(Some(v)))
                     .transpose()?
                     .unwrap_or(0);
                 let reader = TraceReader::open(idx_path, ext_path.as_deref())?;
+                if base_addr == 0 {
+                    base_addr = reader.archive_base_addr().unwrap_or(0);
+                }
                 let groups: Vec<Value> = reader
                     .scan_crypto()
                     .into_iter()
@@ -1358,7 +1367,7 @@ impl McpServer {
                     opts.max_insns = mi as usize;
                 }
                 opts.max_steps = opt_u64_range(args, "maxSteps", 1, 2000)?.unwrap_or(200) as usize;
-                let base_addr = args
+                let mut base_addr = args
                     .get("baseAddr")
                     .filter(|v| !v.is_null())
                     .map(|v| parse_addr_val(Some(v)))
@@ -1366,6 +1375,9 @@ impl McpServer {
                     .unwrap_or(0);
 
                 let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+                if base_addr == 0 {
+                    base_addr = reader.archive_base_addr().unwrap_or(0);
+                }
                 let report = reader.analyze_vm(&opts);
                 Ok(json!({
                     "scannedInsns": report.scanned_insns,
@@ -1435,7 +1447,7 @@ impl McpServer {
                     crate::tracer::TaintSeed::Reg { reg_id: slot }
                 } else if let Some(av) = addr_opt {
                     let addr = parse_addr_val(Some(av))?;
-                    let len = opt_u64_range(args, "len", 1, 8)?.unwrap_or(4) as usize;
+                    let len = opt_u64_range(args, "len", 1, 64)?.unwrap_or(4) as usize;
                     crate::tracer::TaintSeed::Mem { addr, len }
                 } else {
                     return Err(anyhow!("trace_decompile 需要提供 addr 或 reg 参数"));
@@ -1523,8 +1535,11 @@ impl McpServer {
                     "simplifiedNodes": report.simplified_nodes,
                     "missingExtWarning": reader.missing_ext_warning(),
                     "originAnnotations": report.origin_annotations,
+                    "outputLen": report.output_len,
                     "expectedOutputHex": report.expected_output.map(|v| format!("0x{v:x}")),
                     "evaluatedOutputHex": report.evaluated_output.map(|v| format!("0x{v:x}")),
+                    "expectedOutputBytesHex": report.expected_output_bytes_hex,
+                    "evaluatedOutputBytesHex": report.evaluated_output_bytes_hex,
                     "verified": report.verified,
                     "cCode": report.c_code,
                     "smt2": report.smt2,
@@ -2277,7 +2292,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "trace_decompile",
-            "description": "Dynamic taint slice -> single-path Bit-Vector SSA symbolic lifting -> algebraic/rotate/MBA deobfuscation -> self-verified compilable pseudo-C (and optional QF_BV SMT-LIB2 export). Zero path explosion, zero external solver dependency.",
+            "description": "Dynamic taint slice -> single-path Bit-Vector SSA symbolic lifting -> algebraic/rotate/MBA deobfuscation -> self-verified compilable pseudo-C (and optional QF_BV / QF_UFBV SMT-LIB2 export). Zero path explosion, zero external solver dependency.",
             "inputSchema": {
                 "type": "object",
                 "required": ["idxPath"],
@@ -2285,7 +2300,7 @@ fn tool_definitions() -> Value {
                     "idxPath": { "type": "string", "description": "Path to trace.idx file" },
                     "extPath": { "type": "string", "description": "Optional trace.ext path (auto-detected if sibling exists)" },
                     "addr": { "description": "Target output memory address (integer or '0x...' hex string; mutually exclusive with reg)" },
-                    "len": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Output memory width in bytes (default 4)" },
+                    "len": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Output memory width in bytes (1..8 scalar return, 9..64 multi-output uint8_t *out buffer; default 4)" },
                     "reg": { "type": "string", "description": "Target output register (e.g. 'x0', 'w0'; mutually exclusive with addr)" },
                     "atIdx": { "type": "integer", "minimum": 0, "description": "Observation instruction index (default last instruction)" },
                     "fromIdx": { "type": "integer", "minimum": 0, "description": "Optional slice lower bound index (inclusive) to isolate a single loop round or phase" },
@@ -2296,7 +2311,7 @@ fn tool_definitions() -> Value {
                     "maxSteps": { "type": "integer", "minimum": 1, "maximum": 16384, "description": "Max taint slice steps (default 4096)" },
                     "functionName": { "type": "string", "description": "Generated C function name (default 'decompiled_slice')" },
                     "simplify": { "type": "boolean", "description": "Enable algebraic, rotate, and MBA deobfuscation passes (default true)" },
-                    "emitSmt2": { "type": "boolean", "description": "Also emit standard QF_BV SMT-LIB2 for external Z3/Bitwuzla inversion (default false)" },
+                    "emitSmt2": { "type": "boolean", "description": "Also emit standard QF_BV / QF_UFBV SMT-LIB2 for external Z3/Bitwuzla inversion (default false)" },
                     "trackMemIndex": { "type": "boolean", "description": "Track indexed table/S-Box lookups (default true)" },
                     "trackSp": { "type": "boolean", "description": "Track SP arithmetic (default false)" }
                 }

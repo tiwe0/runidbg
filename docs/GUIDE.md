@@ -25,7 +25,9 @@ runidbg-cli [--log-level <trace|debug|info|warn|error>] [--log-format <compact|j
 | `search` / `find` | 离线检索寄存器值 / 访存地址 / PC / ASCII / 字节序列（支持 `--seq-range` / `--only-writes` / `--only-reads` / `--no-hle`） | `runidbg-cli find trace.idx --addr 0x50006470 --len 8 --seq-range 1000..50000 --only-writes` |
 | `mem` | 离线重建任意 `--at <seq>` 时刻内存区间快照（支持 `--hexdump` / `--hex` / `--out file.bin`） | `runidbg-cli mem trace.idx --addr 0x50006170 --len 576 --at 1820000` |
 | `taint` | 离线字节级前向污点传播与反向因果切片（跨 HLE `memcpy`/熵源标注，支持 `--from-seq` / `--stop-at-pc` / `--stop-mem`） | `runidbg-cli taint trace.idx --mode backward --addr 0x50006470 --len 8 --from-seq 1922597` |
-| `decompile` | 动态污点切片 → 单路径符号提升（含 `UMULH`/`SMULH`/`UBFIZ`/`SBFIZ`/`REV16`）→ 代数/MBA/字节重装化简 + `--fold-rodata` → 自校验精简伪 C（及可选 SMT-LIB2） | `runidbg-cli decompile trace.idx --addr 0x50006470 --len 8 --from-seq 1922597 --fold-rodata --fn round_fn --smt2` |
+| `decompile` | `decompile` v2：动态污点切片 → 单路径符号提升（支持 `1..=64`B 多输出联合反编译 + 跨输出 CSE、`LOAD16/32/64_LE`、`UMULH`/`SMULH`/`UBFIZ`/`SBFIZ`/`REV16`、NEON 128-bit 通道与 ARMv8-CE 硬件 AES `AESE`/`AESD`/`AESMC`/`AESIMC`）→ 代数/MBA/字节重装化简 + `--fold-rodata` → 自校验精简伪 C & `QF_BV`/`QF_UFBV` SMT-LIB2 | `runidbg-cli decompile trace.rtrace --addr 0x50006470 --len 16 --from-seq 1922597 --fold-rodata --fn round_fn --smt2` |
+| `pack` | 将 `.idx` + 伴生 `.ext` 裁剪尾部零填充并 Deflate 压缩为带双层 CRC32 的单文件 `.rtrace` 归档（支持 `--base` / `--note` / `--level 0..9` / `--no-ext`；所有离线命令、UI、JS 与 MCP 均透明免解包直读 `.rtrace`） | `runidbg-cli pack trace.idx --base 0x40000000 --note "sign v2" --out trace.rtrace` |
+| `unpack` | 查看 `.rtrace` 归档头/元信息（`--info`）或安全校验 CRC32 解包还原为 `.idx` / `.ext`（支持 `--out-dir` / `--stem` / `--force`） | `runidbg-cli unpack trace.rtrace --info` 或 `runidbg-cli unpack trace.rtrace --out-dir ./out` |
 | `diff` | 双跑 Trace 差分（首次控制流/数据流分歧，或加 `--target-addr` 自动对差异字节段做反向污点联动溯源） | `runidbg-cli diff a.idx b.idx --target-addr 0x50006850 --len 32` |
 | `vm` | OLLVM / 自定义字节码 VM 专项分析（自动识别调度循环、跳转表、opmap 步长与寄存器堆差分，支持 `--seq-range`） | `runidbg-cli vm trace.idx --seq-range 1821500..1824500 --base-reg x25 --layout 6:6,12,17,22,27` |
 | `stats` | 离线热点统计（唯一 PC、Top-N 热点指令与 `BL` 目标；缺失伴生 `.ext` 时自动输出 `WARN`） | `runidbg-cli stats trace.idx --base 0x40000000 --top 20` |
@@ -389,7 +391,7 @@ let vm  = reader.analyze_vm(&VmAnalysisOptions::default());
 ```mermaid
 flowchart TB
     subgraph Entry["接入与协议层"]
-        CLI["runidbg-cli · run / serve / mcp / debug / tape / mem / taint / decompile / diff / vm / ui"]
+        CLI["runidbg-cli · run / serve / mcp / debug / tape / pack / unpack / mem / taint / decompile / diff / vm / ui"]
         RPC["Async RPC (tokio + axum) · Batch / Metrics / Hot Reload"]
         MCP["MCP Server (stdio / HTTP) · 39 Tools"]
         GDB["GDB RSP Stub (Unicorn) · rs / rc / Reverse Watch"]

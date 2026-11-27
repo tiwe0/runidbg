@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use bad64::{Imm, Instruction, Operand, Reg, Shift};
+use bad64::{ArrSpec, Imm, Instruction, Operand, Reg, Shift};
 
 use crate::tracer::reader::TraceReader;
 use crate::tracer::record::{ExtKind, ExtRecord, HleTraceEvent};
@@ -111,8 +111,14 @@ pub struct DecompileReport {
     pub inputs: Vec<DecompiledInput>,
     pub tables: Vec<DecompiledTable>,
     pub origin_annotations: Vec<String>,
+    /// 目标输出字节宽（标量 1/2/4/8B，多输出缓冲区模式为 `9..=64`B）
+    pub output_len: usize,
     pub expected_output: Option<u64>,
     pub evaluated_output: Option<u64>,
+    /// 多输出缓冲区模式下的完整十六进制期望字节串（按地址升序）
+    pub expected_output_bytes_hex: Option<String>,
+    /// 多输出缓冲区模式下的完整十六进制求值字节串（按地址升序）
+    pub evaluated_output_bytes_hex: Option<String>,
     /// `Some(true)` = 化简后表达式在 Trace 真实输入上与真实输出逐 bit 一致
     pub verified: Option<bool>,
     pub c_code: String,
@@ -221,6 +227,14 @@ impl BvBinOp {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AesOpKind {
+    Aese,
+    Aesd,
+    Aesmc,
+    Aesimc,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum BvNode {
     Const {
@@ -261,6 +275,15 @@ enum BvNode {
         sample_idx: Option<u64>,
         sample_out: u64,
     },
+    /// ARMv8 硬件 AES 原语（128-bit 状态拆分为 lo/hi 两个 64-bit 输出节点）
+    AesOp {
+        kind: AesOpKind,
+        state_lo: NodeId,
+        state_hi: NodeId,
+        key_lo: Option<NodeId>,
+        key_hi: Option<NodeId>,
+        hi_half: bool,
+    },
     Opaque {
         asm: String,
         args: Vec<NodeId>,
@@ -279,6 +302,7 @@ impl BvNode {
             | Self::Extract { width, .. }
             | Self::TableLoad { width, .. }
             | Self::Opaque { width, .. } => *width,
+            Self::AesOp { .. } => 64,
             Self::SymMemByte { .. } => 8,
         }
     }
@@ -658,6 +682,45 @@ impl BvArena {
                     width,
                     sample_idx,
                     sample_out,
+                })
+            }
+            BvNode::AesOp {
+                kind,
+                state_lo,
+                state_hi,
+                key_lo,
+                key_hi,
+                hi_half,
+            } => {
+                let slo = self.simplify_rec(state_lo, memo);
+                let shi = self.simplify_rec(state_hi, memo);
+                let klo = key_lo.map(|k| self.simplify_rec(k, memo));
+                let khi = key_hi.map(|k| self.simplify_rec(k, memo));
+                // 若全部输入为编译期常量，直接常量折叠为精确 64-bit 结果
+                if let (Some(vslo), Some(vshi)) = (self.as_const(slo), self.as_const(shi)) {
+                    let key_consts = match (klo, khi) {
+                        (Some(a), Some(b)) => match (self.as_const(a), self.as_const(b)) {
+                            (Some(va), Some(vb)) => Some(Some((va, vb))),
+                            _ => None,
+                        },
+                        (None, None) => Some(None),
+                        _ => None,
+                    };
+                    if let Some(kc) = key_consts {
+                        let (rlo, rhi) = eval_aes_op_128(kind, (vslo, vshi), kc);
+                        let v = if hi_half { rhi } else { rlo };
+                        let out = self.c(v, 64);
+                        memo.insert(id, out);
+                        return out;
+                    }
+                }
+                self.intern_node(BvNode::AesOp {
+                    kind,
+                    state_lo: slo,
+                    state_hi: shi,
+                    key_lo: klo,
+                    key_hi: khi,
+                    hi_half,
                 })
             }
             BvNode::Opaque {
@@ -1168,10 +1231,12 @@ impl BvArena {
         None
     }
 
-    /// 统计从 `root` 可达的节点数
-    fn count_reachable(&self, root: NodeId) -> usize {
+    /// 统计从一组 `roots` 可达的节点并集数
+    fn count_reachable_many(&self, roots: &[NodeId]) -> usize {
         let mut vis = HashSet::new();
-        self.visit_reachable(root, &mut vis);
+        for &r in roots {
+            self.visit_reachable(r, &mut vis);
+        }
         vis.len()
     }
 
@@ -1187,6 +1252,22 @@ impl BvArena {
                 self.visit_reachable(*b, vis);
             }
             BvNode::TableLoad { idx, .. } => self.visit_reachable(*idx, vis),
+            BvNode::AesOp {
+                state_lo,
+                state_hi,
+                key_lo,
+                key_hi,
+                ..
+            } => {
+                self.visit_reachable(*state_lo, vis);
+                self.visit_reachable(*state_hi, vis);
+                if let Some(k) = key_lo {
+                    self.visit_reachable(*k, vis);
+                }
+                if let Some(k) = key_hi {
+                    self.visit_reachable(*k, vis);
+                }
+            }
             BvNode::Opaque { args, .. } => {
                 for &a in args {
                     self.visit_reachable(a, vis);
@@ -1233,6 +1314,25 @@ impl BvArena {
                 // 严禁回退到 sample_out 掩盖索引错误：必须在已观测表项中精确命中
                 let v = self.tables[*table_id].observed_entries.get(&vidx).copied()?;
                 Some(v & width_mask(*width))
+            }
+            BvNode::AesOp {
+                kind,
+                state_lo,
+                state_hi,
+                key_lo,
+                key_hi,
+                hi_half,
+            } => {
+                let vslo = self.eval_sample_rec(*state_lo, memo)?;
+                let vshi = self.eval_sample_rec(*state_hi, memo)?;
+                let kv = match (key_lo, key_hi) {
+                    (Some(kl), Some(kh)) => {
+                        Some((self.eval_sample_rec(*kl, memo)?, self.eval_sample_rec(*kh, memo)?))
+                    }
+                    _ => None,
+                };
+                let (rlo, rhi) = eval_aes_op_128(*kind, (vslo, vshi), kv);
+                Some(if *hi_half { rhi } else { rlo })
             }
             // 含未建模 Opaque 指令时绝不可返回 Some(sample) 制造假阳性 verified == Some(true)
             BvNode::Opaque { .. } => None,
@@ -1335,6 +1435,136 @@ fn eval_binop(op: BvBinOp, a: u64, b: u64, width: u8) -> Option<u64> {
     Some(res)
 }
 
+// ── FIPS-197 AES-128 单轮原语求值（严格匹配 ARMv8-CE AESE/AESD/AESMC/AESIMC 语义） ──
+
+const AES_SBOX: [u8; 256] = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+];
+
+const AES_INV_SBOX: [u8; 256] = [
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
+];
+
+#[inline]
+fn aes_xtime(x: u8) -> u8 {
+    (x << 1) ^ if (x & 0x80) != 0 { 0x1b } else { 0 }
+}
+
+#[inline]
+fn aes_gmul(mut a: u8, mut b: u8) -> u8 {
+    let mut p = 0u8;
+    for _ in 0..8 {
+        if (b & 1) != 0 {
+            p ^= a;
+        }
+        a = aes_xtime(a);
+        b >>= 1;
+    }
+    p
+}
+
+fn eval_aes_op_128(kind: AesOpKind, state: (u64, u64), key: Option<(u64, u64)>) -> (u64, u64) {
+    let mut s = [0u8; 16];
+    s[0..8].copy_from_slice(&state.0.to_le_bytes());
+    s[8..16].copy_from_slice(&state.1.to_le_bytes());
+    let mut out = [0u8; 16];
+    match kind {
+        AesOpKind::Aese => {
+            if let Some((klo, khi)) = key {
+                let mut k = [0u8; 16];
+                k[0..8].copy_from_slice(&klo.to_le_bytes());
+                k[8..16].copy_from_slice(&khi.to_le_bytes());
+                for i in 0..16 {
+                    s[i] ^= k[i];
+                }
+            }
+            for c in 0..4 {
+                for r in 0..4 {
+                    out[c * 4 + r] = AES_SBOX[s[((c + r) % 4) * 4 + r] as usize];
+                }
+            }
+        }
+        AesOpKind::Aesd => {
+            if let Some((klo, khi)) = key {
+                let mut k = [0u8; 16];
+                k[0..8].copy_from_slice(&klo.to_le_bytes());
+                k[8..16].copy_from_slice(&khi.to_le_bytes());
+                for i in 0..16 {
+                    s[i] ^= k[i];
+                }
+            }
+            for c in 0..4 {
+                for r in 0..4 {
+                    out[c * 4 + r] = AES_INV_SBOX[s[((c + 4 - r) % 4) * 4 + r] as usize];
+                }
+            }
+        }
+        AesOpKind::Aesmc => {
+            for c in 0..4 {
+                let b = [s[c * 4], s[c * 4 + 1], s[c * 4 + 2], s[c * 4 + 3]];
+                out[c * 4] = aes_gmul(b[0], 2) ^ aes_gmul(b[1], 3) ^ b[2] ^ b[3];
+                out[c * 4 + 1] = b[0] ^ aes_gmul(b[1], 2) ^ aes_gmul(b[2], 3) ^ b[3];
+                out[c * 4 + 2] = b[0] ^ b[1] ^ aes_gmul(b[2], 2) ^ aes_gmul(b[3], 3);
+                out[c * 4 + 3] = aes_gmul(b[0], 3) ^ b[1] ^ b[2] ^ aes_gmul(b[3], 2);
+            }
+        }
+        AesOpKind::Aesimc => {
+            for c in 0..4 {
+                let b = [s[c * 4], s[c * 4 + 1], s[c * 4 + 2], s[c * 4 + 3]];
+                out[c * 4] = aes_gmul(b[0], 0x0e)
+                    ^ aes_gmul(b[1], 0x0b)
+                    ^ aes_gmul(b[2], 0x0d)
+                    ^ aes_gmul(b[3], 0x09);
+                out[c * 4 + 1] = aes_gmul(b[0], 0x09)
+                    ^ aes_gmul(b[1], 0x0e)
+                    ^ aes_gmul(b[2], 0x0b)
+                    ^ aes_gmul(b[3], 0x0d);
+                out[c * 4 + 2] = aes_gmul(b[0], 0x0d)
+                    ^ aes_gmul(b[1], 0x09)
+                    ^ aes_gmul(b[2], 0x0e)
+                    ^ aes_gmul(b[3], 0x0b);
+                out[c * 4 + 3] = aes_gmul(b[0], 0x0b)
+                    ^ aes_gmul(b[1], 0x0d)
+                    ^ aes_gmul(b[2], 0x09)
+                    ^ aes_gmul(b[3], 0x0e);
+            }
+        }
+    }
+    let lo = u64::from_le_bytes(out[0..8].try_into().unwrap());
+    let hi = u64::from_le_bytes(out[8..16].try_into().unwrap());
+    (lo, hi)
+}
+
 // ============================================================================
 // 3. 单路径符号提升引擎（Trace + TaintSlice -> BvArena）
 // ============================================================================
@@ -1342,8 +1572,10 @@ fn eval_binop(op: BvBinOp, a: u64, b: u64, width: u8) -> Option<u64> {
 struct SliceLifter<'a> {
     reader: &'a TraceReader,
     arena: BvArena,
-    /// 当前各寄存器槽位的符号表达式（仅当该槽位受污点影响时存在）
+    /// 当前各寄存器槽位的符号表达式（0..32 为 GPR X0..SP，32..64 为向量寄存器 V0..V31 低 64 位）
     sym_regs: [Option<NodeId>; 64],
+    /// 向量寄存器 V0..V31 的高 64 位符号表达式（用于 128-bit NEON / ARMv8-CE AES 精确提升）
+    sym_vec_hi: [Option<NodeId>; 32],
     /// 当前各寄存器槽位的最新具体值（来自 `initial_regs` 与前向 `reg_deltas`）
     concrete_regs: [Option<u64>; 64],
     /// 字节粒度符号内存（`addr -> 8-bit NodeId`）
@@ -1381,6 +1613,7 @@ impl<'a> SliceLifter<'a> {
             reader,
             arena: BvArena::default(),
             sym_regs: [None; 64],
+            sym_vec_hi: [None; 32],
             concrete_regs,
             sym_mem: HashMap::new(),
             origin_regs,
@@ -1407,8 +1640,8 @@ impl<'a> SliceLifter<'a> {
             "gettimeofday" | "clock_gettime" | "time" => "time",
             _ => "ext",
         };
-        // 使用 64..255 的虚拟槽位避免与物理 X0..V31 冲突
-        let pseudo_slot = (64 + (idx % 190)) as u8;
+        // 64..96 保留给向量高 64 位寄存器 arg_vN_hi，96..255 分配给外部熵源/时钟源 HLE 符号
+        let pseudo_slot = (96 + (idx % 159)) as u8;
         self.arena.intern_node(BvNode::SymReg {
             reg_slot: pseudo_slot,
             name: format!("{prefix}_{idx}"),
@@ -1582,6 +1815,12 @@ impl<'a> SliceLifter<'a> {
         let adapted = self.arena.adapt_width(expr, reg_w, false);
         // 写 Wd 自动零扩展到 64 位，但保留 32 位自然宽度便于后续 32 位运算保持干净
         self.sym_regs[slot as usize] = Some(adapted);
+        // ARM64 语义：写标量 FP/SIMD 寄存器 (Dn/Sn/Hn/Bn) 自动清零 Vn 高 64 位
+        if let Some(v_idx) = vec_slot_index(reg) {
+            if reg.size() <= 8 {
+                self.sym_vec_hi[v_idx] = Some(self.arena.c(0, 64));
+            }
+        }
     }
 
     fn store_sym_bytes(&mut self, addr: u64, expr: NodeId, byte_len: usize) {
@@ -1702,7 +1941,7 @@ impl<'a> SliceLifter<'a> {
             return;
         }
 
-        // 1. 存储类指令（STR / STUR / STRB / STRH / STP / STNP）
+        // 1. 存储类指令（STR / STUR / STRB / STRH / STP / STNP / ST1）
         if matches!(
             mnem.as_str(),
             "str" | "stur" | "strb" | "sturb" | "strh" | "sturh" | "stlr" | "stlrb" | "stlrh"
@@ -1710,56 +1949,101 @@ impl<'a> SliceLifter<'a> {
             let Some(Operand::Reg { reg: rt, .. }) = ops.first() else {
                 return;
             };
-            let Some(w_ev) = mem_events
-                .iter()
-                .find(|e| e.kind == ExtKind::MemWrite as u8)
-            else {
-                return;
-            };
-            self.clear_mem_writeback_base(ops.get(1));
-            if w_ev.size_or_reg > 8 || rt.size() > 8 {
-                let sz = (w_ev.size_or_reg as usize).min(16);
-                let opq = self.arena.intern_node(BvNode::Opaque {
-                    asm: format!("#{idx}: {insn}"),
-                    args: Vec::new(),
-                    width: 64,
-                    sample: None,
-                });
-                self.store_sym_bytes(w_ev.addr, opq, sz.min(8));
-                return;
-            }
-            let sz = (w_ev.size_or_reg as usize).clamp(1, 8);
-            let expr = self.reg_expr(*rt, (sz * 8) as u8);
-            self.store_sym_bytes(w_ev.addr, expr, sz);
-            return;
-        }
-        if matches!(mnem.as_str(), "stp" | "stnp") {
-            let writes: Vec<&ExtRecord> = mem_events
+            let mut writes: Vec<&ExtRecord> = mem_events
                 .iter()
                 .filter(|e| e.kind == ExtKind::MemWrite as u8)
                 .collect();
+            if writes.is_empty() {
+                return;
+            }
+            writes.sort_by_key(|e| e.addr);
+            self.clear_mem_writeback_base(ops.get(1));
+            let total_w: usize = writes.iter().map(|e| e.size_or_reg as usize).sum();
+            if rt.size() == 16 || total_w == 16 {
+                let base_addr = writes[0].addr;
+                let (lo, hi) = self.vec_read_pair(*rt);
+                self.store_sym_bytes(base_addr, lo, 8);
+                self.store_sym_bytes(base_addr.wrapping_add(8), hi, 8);
+                return;
+            }
+            let sz = total_w.clamp(1, 8);
+            let expr = self.reg_expr(*rt, (sz * 8) as u8);
+            self.store_sym_bytes(writes[0].addr, expr, sz);
+            return;
+        }
+        if matches!(mnem.as_str(), "stp" | "stnp") {
+            let mut writes: Vec<&ExtRecord> = mem_events
+                .iter()
+                .filter(|e| e.kind == ExtKind::MemWrite as u8)
+                .collect();
+            writes.sort_by_key(|e| e.addr);
             self.clear_mem_writeback_base(ops.get(2));
-            for (slot_i, w_ev) in writes.iter().enumerate().take(2) {
-                if let Some(Operand::Reg { reg: rt, .. }) = ops.get(slot_i) {
-                    if w_ev.size_or_reg > 8 || rt.size() > 8 {
-                        let opq = self.arena.intern_node(BvNode::Opaque {
-                            asm: format!("#{idx}: {insn}"),
-                            args: Vec::new(),
-                            width: 64,
-                            sample: None,
-                        });
-                        self.store_sym_bytes(w_ev.addr, opq, 8);
-                        continue;
+            let is_q_pair = matches!(ops.first(), Some(Operand::Reg { reg, .. }) if reg.size() == 16);
+            if is_q_pair {
+                if let Some(first_w) = writes.first() {
+                    let base = first_w.addr;
+                    for slot_i in 0..2 {
+                        if let Some(Operand::Reg { reg: rt, .. }) = ops.get(slot_i) {
+                            let (lo, hi) = self.vec_read_pair(*rt);
+                            let off = (slot_i as u64) * 16;
+                            self.store_sym_bytes(base.wrapping_add(off), lo, 8);
+                            self.store_sym_bytes(base.wrapping_add(off + 8), hi, 8);
+                        }
                     }
-                    let sz = (w_ev.size_or_reg as usize).clamp(1, 8);
-                    let expr = self.reg_expr(*rt, (sz * 8) as u8);
-                    self.store_sym_bytes(w_ev.addr, expr, sz);
+                }
+                return;
+            }
+            if let Some(first_w) = writes.first() {
+                let base = first_w.addr;
+                for slot_i in 0..2 {
+                    if let Some(Operand::Reg { reg: rt, .. }) = ops.get(slot_i) {
+                        let sz = rt.size().clamp(4, 8);
+                        let expr = self.reg_expr(*rt, (sz * 8) as u8);
+                        self.store_sym_bytes(base.wrapping_add((slot_i * sz) as u64), expr, sz);
+                    }
+                }
+            }
+            return;
+        }
+        if mnem == "st1" {
+            let mut writes: Vec<&ExtRecord> = mem_events
+                .iter()
+                .filter(|e| e.kind == ExtKind::MemWrite as u8)
+                .collect();
+            writes.sort_by_key(|e| e.addr);
+            self.clear_mem_writeback_base(ops.get(1));
+            if let (Some(first_w), Some(Operand::MultiReg { regs, arrspec })) =
+                (writes.first(), ops.first())
+            {
+                let (total_bytes, elem_bytes, lane_opt) = vec_arr_info_opt(*arrspec, 16);
+                let mut cur_addr = first_w.addr;
+                if let Some(lane) = lane_opt {
+                    if elem_bytes > 0 && elem_bytes <= 8 {
+                        for r in regs.iter().flatten() {
+                            let need_total = if (lane + 1) * elem_bytes > 8 { 16 } else { 8 };
+                            let lanes = self.vec_read_lanes(*r, need_total, elem_bytes);
+                            if let Some(&lv) = lanes.get(lane) {
+                                self.store_sym_bytes(cur_addr, lv, elem_bytes);
+                            }
+                            cur_addr = cur_addr.wrapping_add(elem_bytes as u64);
+                        }
+                    }
+                } else {
+                    for r in regs.iter().flatten() {
+                        let lo = self.vec_read_lo(*r);
+                        self.store_sym_bytes(cur_addr, lo, 8);
+                        if total_bytes >= 16 {
+                            let hi = self.vec_read_hi(*r);
+                            self.store_sym_bytes(cur_addr.wrapping_add(8), hi, 8);
+                        }
+                        cur_addr = cur_addr.wrapping_add(total_bytes as u64);
+                    }
                 }
             }
             return;
         }
 
-        // 2. 加载类指令（LDR / LDUR / LDRB / LDRH / LDRSB / LDRSH / LDRSW / LDP / LDNP）
+        // 2. 加载类指令（LDR / LDUR / LDRB / LDRH / LDRSB / LDRSH / LDRSW / LDP / LDNP / LD1）
         if matches!(
             mnem.as_str(),
             "ldr"
@@ -1781,21 +2065,27 @@ impl<'a> SliceLifter<'a> {
             let Some(Operand::Reg { reg: rt, .. }) = ops.first() else {
                 return;
             };
-            let Some(r_ev) = mem_events.iter().find(|e| e.kind == ExtKind::MemRead as u8) else {
-                return;
-            };
-            self.clear_mem_writeback_base(ops.get(1));
-            if r_ev.size_or_reg > 8 || rt.size() > 8 {
-                let opq = self.arena.intern_node(BvNode::Opaque {
-                    asm: format!("#{idx}: {insn}"),
-                    args: Vec::new(),
-                    width: 64,
-                    sample: None,
-                });
-                self.set_reg(*rt, opq);
+            let mut reads: Vec<&ExtRecord> = mem_events
+                .iter()
+                .filter(|e| e.kind == ExtKind::MemRead as u8)
+                .collect();
+            if reads.is_empty() {
                 return;
             }
-            let elem_bytes = (r_ev.size_or_reg as usize).clamp(1, 8);
+            reads.sort_by_key(|e| e.addr);
+            self.clear_mem_writeback_base(ops.get(1));
+            let total_r: usize = reads.iter().map(|e| e.size_or_reg as usize).sum();
+            if rt.size() == 16 || total_r == 16 {
+                let base_addr = reads[0].addr;
+                let (lo_s, hi_s) = sample_16b_from_reads(&reads, base_addr);
+                let lo = self.load_sym_bytes(base_addr, 8, lo_s);
+                let hi = self.load_sym_bytes(base_addr.wrapping_add(8), 8, hi_s);
+                self.vec_write_pair(*rt, lo, hi);
+                return;
+            }
+            let base_addr = reads[0].addr;
+            let elem_bytes = total_r.clamp(1, 8);
+            let sample_val = sample_bytes_from_reads(&reads, base_addr, elem_bytes);
             let reg_w = (rt.size() * 8).clamp(32, 64) as u8;
             let is_signed = matches!(
                 mnem.as_str(),
@@ -1803,49 +2093,142 @@ impl<'a> SliceLifter<'a> {
             );
 
             // 检查是否是 S-Box / 常量查找表访问（索引寄存器受污点影响，且表地址非污点）
-            if let Some(table_node) = self.try_lift_table_load(
-                ops.get(1),
-                r_ev.addr,
-                elem_bytes as u8,
-                r_ev.value,
-                reg_w,
-                is_signed,
-            ) {
-                self.set_reg(*rt, table_node);
-                return;
+            if let Some(sv) = sample_val {
+                if let Some(table_node) = self.try_lift_table_load(
+                    ops.get(1),
+                    base_addr,
+                    elem_bytes as u8,
+                    sv,
+                    reg_w,
+                    is_signed,
+                ) {
+                    self.set_reg(*rt, table_node);
+                    return;
+                }
             }
 
-            let loaded = self.load_sym_bytes(r_ev.addr, elem_bytes, Some(r_ev.value));
+            let loaded = self.load_sym_bytes(base_addr, elem_bytes, sample_val);
             let final_expr = self.arena.adapt_width(loaded, reg_w, is_signed);
             self.set_reg(*rt, final_expr);
             return;
         }
         if matches!(mnem.as_str(), "ldp" | "ldnp" | "ldpsw") {
-            let reads: Vec<&ExtRecord> = mem_events
+            let mut reads: Vec<&ExtRecord> = mem_events
                 .iter()
                 .filter(|e| e.kind == ExtKind::MemRead as u8)
                 .collect();
+            reads.sort_by_key(|e| e.addr);
             self.clear_mem_writeback_base(ops.get(2));
-            let is_signed = mnem == "ldpsw";
-            for (slot_i, r_ev) in reads.iter().enumerate().take(2) {
-                if let Some(Operand::Reg { reg: rt, .. }) = ops.get(slot_i) {
-                    if r_ev.size_or_reg > 8 || rt.size() > 8 {
-                        let opq = self.arena.intern_node(BvNode::Opaque {
-                            asm: format!("#{idx}: {insn}"),
-                            args: Vec::new(),
-                            width: 64,
-                            sample: None,
-                        });
-                        self.set_reg(*rt, opq);
-                        continue;
+            let is_q_pair = matches!(ops.first(), Some(Operand::Reg { reg, .. }) if reg.size() == 16);
+            if is_q_pair {
+                if let Some(first_r) = reads.first() {
+                    let base = first_r.addr;
+                    for slot_i in 0..2 {
+                        if let Some(Operand::Reg { reg: rt, .. }) = ops.get(slot_i) {
+                            let off = (slot_i as u64) * 16;
+                            let addr_q = base.wrapping_add(off);
+                            let (lo_s, hi_s) = sample_16b_from_reads(&reads, addr_q);
+                            let lo = self.load_sym_bytes(addr_q, 8, lo_s);
+                            let hi = self.load_sym_bytes(addr_q.wrapping_add(8), 8, hi_s);
+                            self.vec_write_pair(*rt, lo, hi);
+                        }
                     }
-                    let elem_bytes = (r_ev.size_or_reg as usize).clamp(1, 8);
-                    let reg_w = (rt.size() * 8).clamp(32, 64) as u8;
-                    let loaded = self.load_sym_bytes(r_ev.addr, elem_bytes, Some(r_ev.value));
-                    let final_expr = self.arena.adapt_width(loaded, reg_w, is_signed);
-                    self.set_reg(*rt, final_expr);
+                }
+                return;
+            }
+            let is_signed = mnem == "ldpsw";
+            if let Some(first_r) = reads.first() {
+                let base = first_r.addr;
+                for slot_i in 0..2 {
+                    if let Some(Operand::Reg { reg: rt, .. }) = ops.get(slot_i) {
+                        let elem_bytes = if is_signed {
+                            4
+                        } else {
+                            rt.size().clamp(4, 8)
+                        };
+                        let addr_i = base.wrapping_add((slot_i * elem_bytes) as u64);
+                        let sample_val = sample_bytes_from_reads(&reads, addr_i, elem_bytes);
+                        let reg_w = (rt.size() * 8).clamp(32, 64) as u8;
+                        let loaded = self.load_sym_bytes(addr_i, elem_bytes, sample_val);
+                        let final_expr = self.arena.adapt_width(loaded, reg_w, is_signed);
+                        self.set_reg(*rt, final_expr);
+                    }
                 }
             }
+            return;
+        }
+        if mnem == "ld1" {
+            let mut reads: Vec<&ExtRecord> = mem_events
+                .iter()
+                .filter(|e| e.kind == ExtKind::MemRead as u8)
+                .collect();
+            reads.sort_by_key(|e| e.addr);
+            self.clear_mem_writeback_base(ops.get(1));
+            if let (Some(first_r), Some(Operand::MultiReg { regs, arrspec })) =
+                (reads.first(), ops.first())
+            {
+                let (total_bytes, elem_bytes, lane_opt) = vec_arr_info_opt(*arrspec, 16);
+                let mut cur_addr = first_r.addr;
+                if let Some(lane) = lane_opt {
+                    if elem_bytes > 0 && elem_bytes <= 8 {
+                        for r in regs.iter().flatten() {
+                            let sample_val = sample_bytes_from_reads(&reads, cur_addr, elem_bytes);
+                            let loaded = self.load_sym_bytes(cur_addr, elem_bytes, sample_val);
+                            let mut lanes = self.vec_read_lanes(*r, 16, elem_bytes);
+                            if lane < lanes.len() {
+                                lanes[lane] = self
+                                    .arena
+                                    .adapt_width(loaded, (elem_bytes * 8) as u8, false);
+                                self.vec_write_lanes(*r, &lanes, elem_bytes);
+                            }
+                            cur_addr = cur_addr.wrapping_add(elem_bytes as u64);
+                        }
+                    }
+                } else {
+                    for r in regs.iter().flatten() {
+                        let (lo_s, hi_s) = sample_16b_from_reads(&reads, cur_addr);
+                        let lo = self.load_sym_bytes(cur_addr, 8, lo_s);
+                        let hi = if total_bytes >= 16 {
+                            self.load_sym_bytes(cur_addr.wrapping_add(8), 8, hi_s)
+                        } else {
+                            self.arena.c(0, 64)
+                        };
+                        self.vec_write_pair(*r, lo, hi);
+                        cur_addr = cur_addr.wrapping_add(total_bytes as u64);
+                    }
+                }
+            }
+            return;
+        }
+
+        // 未建模的多寄存器向量访存（LD1R/LD2..4/ST2..4）：不可静默 no-op 泄漏旧符号状态
+        if let Some(Operand::MultiReg { regs, .. }) = ops.first() {
+            self.clear_mem_writeback_base(ops.get(1));
+            if mnem.starts_with("st") {
+                for ev in mem_events {
+                    if ev.kind == ExtKind::MemWrite as u8 {
+                        let sz = (ev.size_or_reg as usize).clamp(1, 16);
+                        for b in 0..sz {
+                            self.sym_mem.remove(&ev.addr.wrapping_add(b as u64));
+                        }
+                    }
+                }
+            } else {
+                let opq = self.arena.intern_node(BvNode::Opaque {
+                    asm: format!("#{idx}: {insn}"),
+                    args: Vec::new(),
+                    width: 64,
+                    sample: None,
+                });
+                for r in regs.iter().flatten() {
+                    self.vec_write_pair(*r, opq, opq);
+                }
+            }
+            return;
+        }
+
+        // 2.5 NEON / SIMD 向量与 ARMv8-CE AES 硬件指令（64-bit / 128-bit 通道精确提升）
+        if self.try_lift_neon_insn(&mnem, ops) {
             return;
         }
 
@@ -1863,7 +2246,16 @@ impl<'a> SliceLifter<'a> {
                 .or(self.concrete_regs[s as usize])
         });
 
-        let lifted = self.lift_data_insn(&mnem, ops, *rd, dst_w, post_val);
+        // 凡涉及向量/浮点寄存器且未被 try_lift_neon_insn 建模的指令（如 mul/neg/rbit/clz/umull 向量版），
+        // 绝不可落入标量 GPR lift_data_insn 造成按 64-bit 标量误提升或泄漏旧 sym_vec_hi！
+        let touches_vec = ops
+            .iter()
+            .any(|o| matches!(o, Operand::Reg { reg, .. } if vec_slot_index(*reg).is_some()));
+        let lifted = if touches_vec {
+            None
+        } else {
+            self.lift_data_insn(&mnem, ops, *rd, dst_w, post_val)
+        };
 
         let final_node = lifted.unwrap_or_else(|| {
             let mut args = Vec::new();
@@ -1880,6 +2272,12 @@ impl<'a> SliceLifter<'a> {
             })
         });
         self.set_reg(*rd, final_node);
+        if let Some(v_idx) = vec_slot_index(*rd) {
+            // 若是未建模的向量指令落入 Opaque，高 64 位同步标记为 Opaque 防止残留旧符号或误清零
+            if matches!(self.arena.get(final_node), BvNode::Opaque { .. }) {
+                self.sym_vec_hi[v_idx] = Some(final_node);
+            }
+        }
     }
 
     fn clear_mem_writeback_base(&mut self, mem_op: Option<&Operand>) {
@@ -1895,6 +2293,677 @@ impl<'a> SliceLifter<'a> {
                 }
             }
         }
+    }
+
+    fn vec_read_lo(&mut self, reg: Reg) -> NodeId {
+        let Some(v_idx) = vec_slot_index(reg) else {
+            return self.arena.c(0, 64);
+        };
+        let slot = (32 + v_idx) as u8;
+        if let Some(sym) = self.sym_regs[slot as usize] {
+            return self.arena.adapt_width(sym, 64, false);
+        }
+        if self.origin_regs.contains(&slot) {
+            let sample = self.concrete_regs[slot as usize];
+            let n = self.arena.sym_reg(slot, 64, sample);
+            self.sym_regs[slot as usize] = Some(n);
+            return n;
+        }
+        if let Some(v) = self.concrete_regs[slot as usize] {
+            self.arena.c(v, 64)
+        } else {
+            let n = self.arena.sym_reg(slot, 64, None);
+            self.sym_regs[slot as usize] = Some(n);
+            n
+        }
+    }
+
+    fn vec_read_hi(&mut self, reg: Reg) -> NodeId {
+        let Some(v_idx) = vec_slot_index(reg) else {
+            return self.arena.c(0, 64);
+        };
+        if let Some(sym) = self.sym_vec_hi[v_idx] {
+            return self.arena.adapt_width(sym, 64, false);
+        }
+        // 64..96 专用于向量高 64 位寄存器 arg_vN_hi（避免与 HLE 熵源 96..255 冲突）
+        let pseudo_hi = (64 + v_idx) as u8;
+        let n = self.arena.intern_node(BvNode::SymReg {
+            reg_slot: pseudo_hi,
+            name: format!("arg_v{v_idx}_hi"),
+            width: 64,
+            sample: None,
+        });
+        self.sym_vec_hi[v_idx] = Some(n);
+        n
+    }
+
+    fn vec_read_pair(&mut self, reg: Reg) -> (NodeId, NodeId) {
+        (self.vec_read_lo(reg), self.vec_read_hi(reg))
+    }
+
+    fn vec_write_pair(&mut self, reg: Reg, lo: NodeId, hi: NodeId) {
+        let Some(v_idx) = vec_slot_index(reg) else {
+            return;
+        };
+        let slot = 32 + v_idx;
+        self.sym_regs[slot] = Some(self.arena.adapt_width(lo, 64, false));
+        self.sym_vec_hi[v_idx] = Some(self.arena.adapt_width(hi, 64, false));
+    }
+
+    fn vec_read_lanes(&mut self, reg: Reg, total_bytes: usize, elem_bytes: usize) -> Vec<NodeId> {
+        if elem_bytes == 0 || elem_bytes > 8 || total_bytes == 0 {
+            return Vec::new();
+        }
+        let lo = self.vec_read_lo(reg);
+        let hi = if total_bytes > 8 {
+            Some(self.vec_read_hi(reg))
+        } else {
+            None
+        };
+        let elem_bits = (elem_bytes * 8) as u8;
+        let count = total_bytes / elem_bytes;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let bit_off = i * elem_bytes * 8;
+            let src = if bit_off < 64 {
+                lo
+            } else {
+                hi.unwrap_or(lo)
+            };
+            let local_lsb = (bit_off % 64) as u8;
+            let lane = if elem_bits == 64 {
+                src
+            } else {
+                self.arena.extract(src, local_lsb, elem_bits)
+            };
+            out.push(lane);
+        }
+        out
+    }
+
+    fn vec_write_lanes(&mut self, reg: Reg, lanes: &[NodeId], elem_bytes: usize) {
+        if elem_bytes == 0 || elem_bytes > 8 {
+            return;
+        }
+        let elem_bits = (elem_bytes * 8) as u8;
+        let lanes_per_half = 8 / elem_bytes;
+        let build_half = |arena: &mut BvArena, slice: &[NodeId]| -> NodeId {
+            if slice.is_empty() {
+                return arena.c(0, 64);
+            }
+            if elem_bytes == 8 {
+                return arena.adapt_width(slice[0], 64, false);
+            }
+            let mut acc = arena.adapt_width(slice[0], 64, false);
+            for (i, &ln) in slice.iter().enumerate().skip(1) {
+                let z = arena.adapt_width(ln, 64, false);
+                let sh = arena.c((i * usize::from(elem_bits)) as u64, 64);
+                let shifted = arena.binop(BvBinOp::Shl, z, sh, 64);
+                acc = arena.binop(BvBinOp::Or, acc, shifted, 64);
+            }
+            acc
+        };
+        let lo_end = lanes.len().min(lanes_per_half);
+        let lo = build_half(&mut self.arena, &lanes[..lo_end]);
+        let hi = if lanes.len() > lanes_per_half {
+            build_half(&mut self.arena, &lanes[lanes_per_half..lanes.len().min(lanes_per_half * 2)])
+        } else {
+            self.arena.c(0, 64)
+        };
+        self.vec_write_pair(reg, lo, hi);
+    }
+
+    /// 尝试以 64/128-bit NEON 通道或 ARMv8-CE AES 原语提升向量指令；命中返回 `true`
+    fn try_lift_neon_insn(&mut self, mnem: &str, ops: &[Operand]) -> bool {
+        let Some(Operand::Reg {
+            reg: rd,
+            arrspec: rd_arr,
+        }) = ops.first()
+        else {
+            return false;
+        };
+        let dst_is_vec = vec_slot_index(*rd).is_some();
+        let src_is_vec = ops
+            .get(1)
+            .is_some_and(|o| matches!(o, Operand::Reg { reg, .. } if vec_slot_index(*reg).is_some()));
+
+        if !dst_is_vec && !src_is_vec {
+            return false;
+        }
+
+        // 1. 标量 <-> 向量桥接指令（UMOV / SMOV / bad64 别名的 MOV Xd/Wd, Vn.<T>[lane] / FMOV / INS / DUP）
+        let is_umov_alias = mnem == "mov"
+            && !dst_is_vec
+            && src_is_vec
+            && matches!(ops.get(1), Some(Operand::Reg { arrspec: Some(a), .. }) if arr_lane(*a).is_some());
+        if matches!(mnem, "umov" | "smov") || is_umov_alias {
+            if let Some(Operand::Reg {
+                reg: rn,
+                arrspec: Some(arr),
+            }) = ops.get(1)
+            {
+                let (_, elem_b, lane_opt) = vec_arr_info_opt(Some(*arr), 16);
+                let lane = lane_opt.unwrap_or(0);
+                if elem_b == 0 || elem_b > 8 {
+                    return false;
+                }
+                let need_total = if (lane + 1) * elem_b > 8 { 16 } else { 8 };
+                let lanes = self.vec_read_lanes(*rn, need_total, elem_b);
+                if let Some(&ln) = lanes.get(lane) {
+                    let dst_w = (rd.size() * 8).clamp(32, 64) as u8;
+                    let expr = self.arena.adapt_width(ln, dst_w, mnem == "smov");
+                    self.set_reg(*rd, expr);
+                    return true;
+                }
+            }
+            return false;
+        }
+        if mnem == "fmov" {
+            if let Some(Operand::Reg {
+                reg: rn,
+                arrspec: src_arr,
+            }) = ops.get(1)
+            {
+                // 高 64 位专用传输：`fmov x4, v28.d[1]` 与 `fmov v28.d[1], x4`
+                if !dst_is_vec && src_is_vec && src_arr.and_then(arr_lane) == Some(1) {
+                    let hi = self.vec_read_hi(*rn);
+                    let dst_w = (rd.size() * 8).clamp(32, 64) as u8;
+                    let expr = self.arena.adapt_width(hi, dst_w, false);
+                    self.set_reg(*rd, expr);
+                    return true;
+                }
+                if dst_is_vec && !src_is_vec && rd_arr.and_then(arr_lane) == Some(1) {
+                    let lo = self.vec_read_lo(*rd);
+                    let hi = self.reg_expr(*rn, 64);
+                    self.vec_write_pair(*rd, lo, hi);
+                    return true;
+                }
+                if dst_is_vec && !src_is_vec {
+                    let exact_w = (rd.size().min(8) * 8).max(8) as u8;
+                    let src = self.reg_expr(*rn, exact_w);
+                    let lo = self.arena.adapt_width(src, 64, false);
+                    let zero = self.arena.c(0, 64);
+                    self.vec_write_pair(*rd, lo, zero);
+                    return true;
+                } else if !dst_is_vec && src_is_vec {
+                    let lo = self.vec_read_lo(*rn);
+                    let src_w = (rn.size().min(8) * 8).max(8) as u8;
+                    let masked = self.arena.adapt_width(lo, src_w, false);
+                    let dst_w = (rd.size() * 8).clamp(32, 64) as u8;
+                    let expr = self.arena.adapt_width(masked, dst_w, false);
+                    self.set_reg(*rd, expr);
+                    return true;
+                } else if dst_is_vec && src_is_vec {
+                    let lo = self.vec_read_lo(*rn);
+                    let exact_w = (rd.size().min(rn.size()).min(8) * 8).max(8) as u8;
+                    let trunc = self.arena.adapt_width(lo, exact_w, false);
+                    let zext = self.arena.adapt_width(trunc, 64, false);
+                    let zero = self.arena.c(0, 64);
+                    self.vec_write_pair(*rd, zext, zero);
+                    return true;
+                }
+            }
+            return false;
+        }
+        if mnem == "ins" || (mnem == "mov" && dst_is_vec && rd_arr.and_then(arr_lane).is_some()) {
+            let (_, elem_b, lane_opt) = vec_arr_info_opt(*rd_arr, 16);
+            if elem_b == 0 || elem_b > 8 {
+                return false;
+            }
+            let dst_lane = lane_opt.unwrap_or(0);
+            let mut lanes = self.vec_read_lanes(*rd, 16, elem_b);
+            if dst_lane >= lanes.len() {
+                return false;
+            }
+            let new_val = match ops.get(1) {
+                Some(Operand::Reg {
+                    reg: rn,
+                    arrspec: Some(src_arr),
+                }) if vec_slot_index(*rn).is_some() => {
+                    let (_, s_eb, s_lane) = vec_arr_info_opt(Some(*src_arr), 16);
+                    let sl_idx = s_lane.unwrap_or(0);
+                    let need_total = if (sl_idx + 1) * s_eb > 8 { 16 } else { 8 };
+                    let src_lanes = self.vec_read_lanes(*rn, need_total, s_eb);
+                    let Some(&sl) = src_lanes.get(sl_idx) else {
+                        return false;
+                    };
+                    self.arena.adapt_width(sl, (elem_b * 8) as u8, false)
+                }
+                Some(Operand::Reg { reg: rn, .. }) => self.reg_expr(*rn, (elem_b * 8) as u8),
+                _ => return false,
+            };
+            lanes[dst_lane] = new_val;
+            self.vec_write_lanes(*rd, &lanes, elem_b);
+            return true;
+        }
+        if !dst_is_vec {
+            return false;
+        }
+
+        // bad64 将标量 `DUP Bd/Hd/Sd/Dd, Vn.<T>[lane]` 反汇编为 `mov b1, v4.b[9]` / `mov s8, v14.s[3]`
+        if mnem == "mov" && rd_arr.is_none() {
+            if let Some(Operand::Reg {
+                reg: rn,
+                arrspec: Some(src_arr),
+            }) = ops.get(1)
+            {
+                if vec_slot_index(*rn).is_some() && arr_lane(*src_arr).is_some() {
+                    let (_, s_eb, s_lane) = vec_arr_info_opt(Some(*src_arr), 16);
+                    let sl_idx = s_lane.unwrap_or(0);
+                    if s_eb == 0 || s_eb > 8 {
+                        return false;
+                    }
+                    let need_total = if (sl_idx + 1) * s_eb > 8 { 16 } else { 8 };
+                    let src_lanes = self.vec_read_lanes(*rn, need_total, s_eb);
+                    let Some(&sl) = src_lanes.get(sl_idx) else {
+                        return false;
+                    };
+                    let lo = self.arena.adapt_width(sl, 64, false);
+                    let zero = self.arena.c(0, 64);
+                    self.vec_write_pair(*rd, lo, zero);
+                    return true;
+                }
+            }
+        }
+
+        // 当无 arrspec 且为标量 B/H/S/D 寄存器时（如 `movi d11` / `add d0, d1, d2` / `shl d0, d1, #k`），
+        // 元素宽度必须等于寄存器标量字节宽，而非退化成 1 字节！
+        let (total_b, elem_b, _) = if rd_arr.is_none() && rd.size() <= 8 {
+            let sz = rd.size().clamp(1, 8);
+            (sz, sz, None)
+        } else {
+            vec_arr_info_opt(*rd_arr, rd.size().clamp(8, 16))
+        };
+        let is_128 = total_b >= 16;
+
+        // 2. ARMv8-CE 硬件 AES 原语（AESE / AESD / AESMC / AESIMC）
+        if matches!(mnem, "aese" | "aesd" | "aesmc" | "aesimc") {
+            let Some(Operand::Reg { reg: rn, .. }) = ops.get(1) else {
+                return false;
+            };
+            let (kind, s_lo, s_hi, k_lo, k_hi) = match mnem {
+                "aese" => {
+                    let (dlo, dhi) = self.vec_read_pair(*rd);
+                    let (nlo, nhi) = self.vec_read_pair(*rn);
+                    (AesOpKind::Aese, dlo, dhi, Some(nlo), Some(nhi))
+                }
+                "aesd" => {
+                    let (dlo, dhi) = self.vec_read_pair(*rd);
+                    let (nlo, nhi) = self.vec_read_pair(*rn);
+                    (AesOpKind::Aesd, dlo, dhi, Some(nlo), Some(nhi))
+                }
+                "aesmc" => {
+                    let (nlo, nhi) = self.vec_read_pair(*rn);
+                    (AesOpKind::Aesmc, nlo, nhi, None, None)
+                }
+                _ => {
+                    let (nlo, nhi) = self.vec_read_pair(*rn);
+                    (AesOpKind::Aesimc, nlo, nhi, None, None)
+                }
+            };
+            let out_lo = self.arena.intern_node(BvNode::AesOp {
+                kind,
+                state_lo: s_lo,
+                state_hi: s_hi,
+                key_lo: k_lo,
+                key_hi: k_hi,
+                hi_half: false,
+            });
+            let out_hi = self.arena.intern_node(BvNode::AesOp {
+                kind,
+                state_lo: s_lo,
+                state_hi: s_hi,
+                key_lo: k_lo,
+                key_hi: k_hi,
+                hi_half: true,
+            });
+            self.vec_write_pair(*rd, out_lo, out_hi);
+            return true;
+        }
+
+        // 3. 向量常量 MOVI / MVNI（支持 LSL 与 MSL 移位）& 广播 DUP
+        if matches!(mnem, "movi" | "mvni") {
+            if elem_b == 0 || elem_b > 8 {
+                return false;
+            }
+            let imm_u64 = match ops.get(1) {
+                Some(Operand::Imm32 { imm, shift } | Operand::Imm64 { imm, shift }) => {
+                    let v = imm_to_u64(*imm);
+                    match shift {
+                        Some(Shift::LSL(s)) => v.wrapping_shl(*s),
+                        Some(Shift::MSL(s)) => v.wrapping_shl(*s) | width_mask(*s as u8),
+                        _ => v,
+                    }
+                }
+                _ => return false,
+            };
+            let val = if mnem == "mvni" { !imm_u64 } else { imm_u64 };
+            let lane_val = self.arena.c(val, (elem_b * 8) as u8);
+            let count = total_b / elem_b;
+            let lanes = vec![lane_val; count];
+            self.vec_write_lanes(*rd, &lanes, elem_b);
+            return true;
+        }
+        if mnem == "dup" {
+            if elem_b == 0 || elem_b > 8 {
+                return false;
+            }
+            let count = total_b / elem_b;
+            let elem_val = match ops.get(1) {
+                Some(Operand::Reg {
+                    reg: rn,
+                    arrspec: Some(src_arr),
+                }) if vec_slot_index(*rn).is_some() => {
+                    let (_, s_eb, s_lane) = vec_arr_info_opt(Some(*src_arr), 16);
+                    let sl_idx = s_lane.unwrap_or(0);
+                    let need_total = if (sl_idx + 1) * s_eb > 8 { 16 } else { 8 };
+                    let src_lanes = self.vec_read_lanes(*rn, need_total, s_eb);
+                    let Some(&sl) = src_lanes.get(sl_idx) else {
+                        return false;
+                    };
+                    self.arena.adapt_width(sl, (elem_b * 8) as u8, false)
+                }
+                Some(Operand::Reg { reg: rn, .. }) => self.reg_expr(*rn, (elem_b * 8) as u8),
+                _ => return false,
+            };
+            let lanes = vec![elem_val; count];
+            self.vec_write_lanes(*rd, &lanes, elem_b);
+            return true;
+        }
+
+        // 4. 64/128-bit 按位逻辑指令（64-bit 模式不读取高 64 位，避免无端引入 arg_vN_hi）
+        if mnem == "mov" {
+            if let Some(Operand::Reg { reg: rn, .. }) = ops.get(1) {
+                if vec_slot_index(*rn).is_some() {
+                    let nlo = self.vec_read_lo(*rn);
+                    let out_hi = if is_128 {
+                        self.vec_read_hi(*rn)
+                    } else {
+                        self.arena.c(0, 64)
+                    };
+                    self.vec_write_pair(*rd, nlo, out_hi);
+                    return true;
+                }
+            }
+            return false;
+        }
+        if matches!(mnem, "not" | "mvn") {
+            let Some(Operand::Reg { reg: rn, .. }) = ops.get(1) else {
+                return false;
+            };
+            let nlo = self.vec_read_lo(*rn);
+            let out_lo = self.arena.unop(BvUnOp::Not, nlo, 64);
+            let out_hi = if is_128 {
+                let nhi = self.vec_read_hi(*rn);
+                self.arena.unop(BvUnOp::Not, nhi, 64)
+            } else {
+                self.arena.c(0, 64)
+            };
+            self.vec_write_pair(*rd, out_lo, out_hi);
+            return true;
+        }
+        if matches!(mnem, "eor" | "orr" | "and" | "bic" | "orn") {
+            let (Some(Operand::Reg { reg: rn, .. }), Some(Operand::Reg { reg: rm, .. })) =
+                (ops.get(1), ops.get(2))
+            else {
+                return false;
+            };
+            let nlo = self.vec_read_lo(*rn);
+            let mlo = self.vec_read_lo(*rm);
+            let apply_bit = |arena: &mut BvArena, a: NodeId, b: NodeId| -> NodeId {
+                match mnem {
+                    "eor" => arena.binop(BvBinOp::Xor, a, b, 64),
+                    "orr" => arena.binop(BvBinOp::Or, a, b, 64),
+                    "and" => arena.binop(BvBinOp::And, a, b, 64),
+                    "bic" => {
+                        let nb = arena.unop(BvUnOp::Not, b, 64);
+                        arena.binop(BvBinOp::And, a, nb, 64)
+                    }
+                    _ => {
+                        let nb = arena.unop(BvUnOp::Not, b, 64);
+                        arena.binop(BvBinOp::Or, a, nb, 64)
+                    }
+                }
+            };
+            let out_lo = apply_bit(&mut self.arena, nlo, mlo);
+            let out_hi = if is_128 {
+                let nhi = self.vec_read_hi(*rn);
+                let mhi = self.vec_read_hi(*rm);
+                apply_bit(&mut self.arena, nhi, mhi)
+            } else {
+                self.arena.c(0, 64)
+            };
+            self.vec_write_pair(*rd, out_lo, out_hi);
+            return true;
+        }
+        if mnem == "eor3" {
+            let (
+                Some(Operand::Reg { reg: rn, .. }),
+                Some(Operand::Reg { reg: rm, .. }),
+                Some(Operand::Reg { reg: ra, .. }),
+            ) = (ops.get(1), ops.get(2), ops.get(3))
+            else {
+                return false;
+            };
+            let (nlo, nhi) = self.vec_read_pair(*rn);
+            let (mlo, mhi) = self.vec_read_pair(*rm);
+            let (alo, ahi) = self.vec_read_pair(*ra);
+            let tlo = self.arena.binop(BvBinOp::Xor, nlo, mlo, 64);
+            let out_lo = self.arena.binop(BvBinOp::Xor, tlo, alo, 64);
+            let thi = self.arena.binop(BvBinOp::Xor, nhi, mhi, 64);
+            let out_hi = self.arena.binop(BvBinOp::Xor, thi, ahi, 64);
+            self.vec_write_pair(*rd, out_lo, out_hi);
+            return true;
+        }
+        if matches!(mnem, "bsl" | "bit" | "bif") {
+            let (Some(Operand::Reg { reg: rn, .. }), Some(Operand::Reg { reg: rm, .. })) =
+                (ops.get(1), ops.get(2))
+            else {
+                return false;
+            };
+            let dlo = self.vec_read_lo(*rd);
+            let nlo = self.vec_read_lo(*rn);
+            let mlo = self.vec_read_lo(*rm);
+            let mux = |arena: &mut BvArena, sel: NodeId, t_val: NodeId, f_val: NodeId| -> NodeId {
+                // (sel & t_val) | (~sel & f_val)
+                let a = arena.binop(BvBinOp::And, sel, t_val, 64);
+                let nsel = arena.unop(BvUnOp::Not, sel, 64);
+                let b = arena.binop(BvBinOp::And, nsel, f_val, 64);
+                arena.binop(BvBinOp::Or, a, b, 64)
+            };
+            let out_lo = match mnem {
+                "bsl" => mux(&mut self.arena, dlo, nlo, mlo),
+                "bit" => mux(&mut self.arena, mlo, nlo, dlo),
+                _ => mux(&mut self.arena, mlo, dlo, nlo),
+            };
+            let out_hi = if is_128 {
+                let dhi = self.vec_read_hi(*rd);
+                let nhi = self.vec_read_hi(*rn);
+                let mhi = self.vec_read_hi(*rm);
+                match mnem {
+                    "bsl" => mux(&mut self.arena, dhi, nhi, mhi),
+                    "bit" => mux(&mut self.arena, mhi, nhi, dhi),
+                    _ => mux(&mut self.arena, mhi, dhi, nhi),
+                }
+            } else {
+                self.arena.c(0, 64)
+            };
+            self.vec_write_pair(*rd, out_lo, out_hi);
+            return true;
+        }
+
+        // 5. 通道级整型运算（ADD / SUB / SHL / USHR / SSHR / SLI / SRI）
+        if matches!(mnem, "add" | "sub") {
+            if elem_b == 0 || elem_b > 8 {
+                return false;
+            }
+            let (Some(Operand::Reg { reg: rn, .. }), Some(Operand::Reg { reg: rm, .. })) =
+                (ops.get(1), ops.get(2))
+            else {
+                return false;
+            };
+            let a_lanes = self.vec_read_lanes(*rn, total_b, elem_b);
+            let b_lanes = self.vec_read_lanes(*rm, total_b, elem_b);
+            let op = if mnem == "add" { BvBinOp::Add } else { BvBinOp::Sub };
+            let bits = (elem_b * 8) as u8;
+            let out: Vec<NodeId> = a_lanes
+                .into_iter()
+                .zip(b_lanes)
+                .map(|(a, b)| self.arena.binop(op, a, b, bits))
+                .collect();
+            self.vec_write_lanes(*rd, &out, elem_b);
+            return true;
+        }
+        if matches!(mnem, "shl" | "ushr" | "sshr" | "sli" | "sri") {
+            if elem_b == 0 || elem_b > 8 {
+                return false;
+            }
+            let (Some(Operand::Reg { reg: rn, .. }), Some(sh_op)) = (ops.get(1), ops.get(2)) else {
+                return false;
+            };
+            let sh_amt = match sh_op {
+                Operand::Imm32 { imm, .. } | Operand::Imm64 { imm, .. } => imm_to_u64(*imm),
+                _ => return false,
+            };
+            let bits = (elem_b * 8) as u8;
+            let src_lanes = self.vec_read_lanes(*rn, total_b, elem_b);
+            let dst_lanes = if matches!(mnem, "sli" | "sri") {
+                Some(self.vec_read_lanes(*rd, total_b, elem_b))
+            } else {
+                None
+            };
+            let mut out = Vec::with_capacity(src_lanes.len());
+            for (i, s) in src_lanes.into_iter().enumerate() {
+                let res = if sh_amt >= u64::from(bits) {
+                    // ARMv8-A 合法右移范围 1..=elem_bits（如 `sshr .4s, #32` 提取符号掩码，`ushr #bits` -> 0）
+                    match mnem {
+                        "shl" | "ushr" => self.arena.c(0, bits),
+                        "sshr" => {
+                            let max_sh = self.arena.c(u64::from(bits - 1), bits);
+                            self.arena.binop(BvBinOp::Ashr, s, max_sh, bits)
+                        }
+                        _ => dst_lanes.as_ref().unwrap()[i],
+                    }
+                } else if sh_amt == 0 {
+                    s
+                } else {
+                    let sh_node = self.arena.c(sh_amt, bits);
+                    match mnem {
+                        "shl" => self.arena.binop(BvBinOp::Shl, s, sh_node, bits),
+                        "ushr" => self.arena.binop(BvBinOp::Lshr, s, sh_node, bits),
+                        "sshr" => self.arena.binop(BvBinOp::Ashr, s, sh_node, bits),
+                        "sli" => {
+                            let d = dst_lanes.as_ref().unwrap()[i];
+                            let mask = self.arena.c(width_mask(sh_amt as u8), bits);
+                            let keep = self.arena.binop(BvBinOp::And, d, mask, bits);
+                            let shifted = self.arena.binop(BvBinOp::Shl, s, sh_node, bits);
+                            self.arena.binop(BvBinOp::Or, keep, shifted, bits)
+                        }
+                        _ => {
+                            let d = dst_lanes.as_ref().unwrap()[i];
+                            let top_mask = !width_mask(bits - (sh_amt as u8)) & width_mask(bits);
+                            let top_mask_c = self.arena.c(top_mask, bits);
+                            let keep = self.arena.binop(BvBinOp::And, d, top_mask_c, bits);
+                            let shifted = self.arena.binop(BvBinOp::Lshr, s, sh_node, bits);
+                            self.arena.binop(BvBinOp::Or, keep, shifted, bits)
+                        }
+                    }
+                };
+                out.push(res);
+            }
+            self.vec_write_lanes(*rd, &out, elem_b);
+            return true;
+        }
+
+        // 6. 字节/通道重排（EXT / REV64 / REV32 / REV16 / UZP1 / UZP2 / ZIP1 / ZIP2 / TRN1 / TRN2）
+        if mnem == "ext" {
+            let (
+                Some(Operand::Reg { reg: rn, .. }),
+                Some(Operand::Reg { reg: rm, .. }),
+                Some(Operand::Imm32 { imm, .. } | Operand::Imm64 { imm, .. }),
+            ) = (ops.get(1), ops.get(2), ops.get(3))
+            else {
+                return false;
+            };
+            let idx = (imm_to_u64(*imm) as usize) % total_b;
+            let a = self.vec_read_lanes(*rn, total_b, 1);
+            let b = self.vec_read_lanes(*rm, total_b, 1);
+            let mut out = Vec::with_capacity(total_b);
+            out.extend_from_slice(&a[idx..]);
+            out.extend_from_slice(&b[..idx]);
+            self.vec_write_lanes(*rd, &out, 1);
+            return true;
+        }
+        if matches!(mnem, "rev64" | "rev32" | "rev16") {
+            let Some(Operand::Reg { reg: rn, .. }) = ops.get(1) else {
+                return false;
+            };
+            let container_b = match mnem {
+                "rev64" => 8usize,
+                "rev32" => 4usize,
+                _ => 2usize,
+            };
+            if elem_b >= container_b {
+                return false;
+            }
+            let mut lanes = self.vec_read_lanes(*rn, total_b, elem_b);
+            let group = container_b / elem_b;
+            for chunk in lanes.chunks_mut(group) {
+                chunk.reverse();
+            }
+            self.vec_write_lanes(*rd, &lanes, elem_b);
+            return true;
+        }
+        if matches!(mnem, "uzp1" | "uzp2" | "zip1" | "zip2" | "trn1" | "trn2") {
+            let (Some(Operand::Reg { reg: rn, .. }), Some(Operand::Reg { reg: rm, .. })) =
+                (ops.get(1), ops.get(2))
+            else {
+                return false;
+            };
+            let a = self.vec_read_lanes(*rn, total_b, elem_b);
+            let b = self.vec_read_lanes(*rm, total_b, elem_b);
+            let n = a.len();
+            let half = n / 2;
+            let mut out = Vec::with_capacity(n);
+            match mnem {
+                "uzp1" => {
+                    for i in (0..n).step_by(2) { out.push(a[i]); }
+                    for i in (0..n).step_by(2) { out.push(b[i]); }
+                }
+                "uzp2" => {
+                    for i in (1..n).step_by(2) { out.push(a[i]); }
+                    for i in (1..n).step_by(2) { out.push(b[i]); }
+                }
+                "zip1" => {
+                    for i in 0..half {
+                        out.push(a[i]);
+                        out.push(b[i]);
+                    }
+                }
+                "zip2" => {
+                    for i in half..n {
+                        out.push(a[i]);
+                        out.push(b[i]);
+                    }
+                }
+                "trn1" => {
+                    for i in (0..n).step_by(2) {
+                        out.push(a[i]);
+                        out.push(b[i]);
+                    }
+                }
+                _ => {
+                    for i in (1..n).step_by(2) {
+                        out.push(a[i]);
+                        out.push(b[i]);
+                    }
+                }
+            }
+            self.vec_write_lanes(*rd, &out, elem_b);
+            return true;
+        }
+
+        false
     }
 
     fn lift_data_insn(
@@ -2343,6 +3412,88 @@ fn imm_to_u64(imm: Imm) -> u64 {
     }
 }
 
+fn vec_slot_index(reg: Reg) -> Option<usize> {
+    let slot = parse_reg_slot(reg.name())?;
+    if (32..64).contains(&slot) {
+        Some((slot - 32) as usize)
+    } else {
+        None
+    }
+}
+
+fn arr_lane(arr: ArrSpec) -> Option<usize> {
+    let opt = match arr {
+        ArrSpec::Full(l)
+        | ArrSpec::TwoDoubles(l)
+        | ArrSpec::FourSingles(l)
+        | ArrSpec::EightHalves(l)
+        | ArrSpec::SixteenBytes(l)
+        | ArrSpec::OneDouble(l)
+        | ArrSpec::TwoSingles(l)
+        | ArrSpec::FourHalves(l)
+        | ArrSpec::EightBytes(l)
+        | ArrSpec::OneSingle(l)
+        | ArrSpec::TwoHalves(l)
+        | ArrSpec::FourBytes(l)
+        | ArrSpec::OneHalf(l)
+        | ArrSpec::OneByte(l) => l,
+    };
+    opt.map(|v| v as usize)
+}
+
+/// 解析向量排列规格，返回 `(total_bytes, elem_bytes, lane_opt)`
+fn vec_arr_info_opt(arr: Option<ArrSpec>, default_total: usize) -> (usize, usize, Option<usize>) {
+    match arr {
+        Some(ArrSpec::SixteenBytes(l)) => (16, 1, l.map(|v| v as usize)),
+        Some(ArrSpec::EightHalves(l)) => (16, 2, l.map(|v| v as usize)),
+        Some(ArrSpec::FourSingles(l)) => (16, 4, l.map(|v| v as usize)),
+        Some(ArrSpec::TwoDoubles(l)) => (16, 8, l.map(|v| v as usize)),
+        Some(ArrSpec::EightBytes(l)) => (8, 1, l.map(|v| v as usize)),
+        Some(ArrSpec::FourHalves(l)) => (8, 2, l.map(|v| v as usize)),
+        Some(ArrSpec::TwoSingles(l)) => (8, 4, l.map(|v| v as usize)),
+        Some(ArrSpec::OneDouble(l)) => (8, 8, l.map(|v| v as usize)),
+        Some(ArrSpec::FourBytes(l)) => (4, 1, l.map(|v| v as usize)),
+        Some(ArrSpec::TwoHalves(l)) => (4, 2, l.map(|v| v as usize)),
+        Some(ArrSpec::OneSingle(l)) => (4, 4, l.map(|v| v as usize)),
+        Some(ArrSpec::OneHalf(l)) => (2, 2, l.map(|v| v as usize)),
+        Some(ArrSpec::OneByte(l)) => (1, 1, l.map(|v| v as usize)),
+        Some(ArrSpec::Full(l)) => (16, 16, l.map(|v| v as usize)),
+        None => (default_total.clamp(8, 16), 1, None),
+    }
+}
+
+/// 从单条指令的 `MemRead` 事件切片中重组 `[base_addr, base_addr + byte_len)`（`1..=8` 字节，兼容跨页拆分读）
+fn sample_bytes_from_reads(reads: &[&ExtRecord], base_addr: u64, byte_len: usize) -> Option<u64> {
+    let n = byte_len.clamp(1, 8);
+    let mut bytes = [None::<u8>; 8];
+    for ev in reads {
+        let sz = (ev.size_or_reg as usize).clamp(1, 8);
+        for b in 0..sz {
+            let a = ev.addr.wrapping_add(b as u64);
+            let off = a.wrapping_sub(base_addr);
+            if (off as usize) < n {
+                bytes[off as usize] = Some(((ev.value >> (b * 8)) & 0xFF) as u8);
+            }
+        }
+    }
+    if !bytes[..n].iter().all(Option::is_some) {
+        return None;
+    }
+    let mut acc = 0u64;
+    for (i, b) in bytes[..n].iter().enumerate() {
+        acc |= u64::from(b.unwrap()) << (i * 8);
+    }
+    Some(acc)
+}
+
+/// 从单条指令的 `MemRead` 事件切片中重组 `[base_addr, base_addr + 16)` 的低/高 64 位具体样本值
+fn sample_16b_from_reads(reads: &[&ExtRecord], base_addr: u64) -> (Option<u64>, Option<u64>) {
+    (
+        sample_bytes_from_reads(reads, base_addr, 8),
+        sample_bytes_from_reads(reads, base_addr.wrapping_add(8), 8),
+    )
+}
+
 // ============================================================================
 // 4. 精简伪 C 生成器（含连续输入缓冲归并 + CSE 公共子表达式提取）与 SMT-LIB2 导出
 // ============================================================================
@@ -2354,6 +3505,24 @@ struct MemBufGroup {
     samples: Vec<Option<u8>>,
 }
 
+struct OutputChunkSpec {
+    byte_offset: usize,
+    byte_len: usize,
+    root: NodeId,
+    expected: Option<u64>,
+    evaluated: Option<u64>,
+}
+
+struct EmitMeta<'a> {
+    is_multi_buf: bool,
+    fn_name: &'a str,
+    expected_out: Option<u64>,
+    eval_out: Option<u64>,
+    expected_bytes_hex: Option<&'a str>,
+    eval_bytes_hex: Option<&'a str>,
+    verified: Option<bool>,
+}
+
 struct CCodeEmitter<'a> {
     arena: &'a BvArena,
     /// `addr -> (buf_idx, offset)`
@@ -2361,6 +3530,16 @@ struct CCodeEmitter<'a> {
     mem_bufs: Vec<MemBufGroup>,
     sym_regs: Vec<(u8, String, u8, Option<u64>)>,
     used_tables: BTreeSet<usize>,
+    need_load16: bool,
+    need_load32: bool,
+    need_load64: bool,
+    need_store16: bool,
+    need_store32: bool,
+    need_store64: bool,
+    need_aes_aese: bool,
+    need_aes_aesd: bool,
+    need_aes_mc: bool,
+    need_aes_imc: bool,
     need_rotr32: bool,
     need_rotr64: bool,
     need_bswap16: bool,
@@ -2370,6 +3549,8 @@ struct CCodeEmitter<'a> {
     need_rbit64: bool,
     need_clz32: bool,
     need_clz64: bool,
+    need_ashr8: bool,
+    need_ashr16: bool,
     need_ashr32: bool,
     need_ashr64: bool,
     need_udiv32: bool,
@@ -2384,17 +3565,23 @@ struct CCodeEmitter<'a> {
 }
 
 impl<'a> CCodeEmitter<'a> {
-    fn emit(
+    fn emit_multi(
         arena: &'a BvArena,
-        root: NodeId,
-        fn_name: &str,
-        expected_out: Option<u64>,
-        eval_out: Option<u64>,
-        verified: Option<bool>,
+        chunks: &[OutputChunkSpec],
+        meta: &EmitMeta<'_>,
     ) -> (String, Vec<DecompiledInput>, Vec<DecompiledTable>) {
-        // 1. 收集从 root 可达的所有符号输入与查找表
+        let is_multi_buf = meta.is_multi_buf;
+        let fn_name = meta.fn_name;
+        let expected_out = meta.expected_out;
+        let eval_out = meta.eval_out;
+        let expected_bytes_hex = meta.expected_bytes_hex;
+        let eval_bytes_hex = meta.eval_bytes_hex;
+        let verified = meta.verified;
+        // 1. 收集从全部输出根可达的符号输入与查找表
         let mut reachable = HashSet::new();
-        arena.visit_reachable(root, &mut reachable);
+        for ch in chunks {
+            arena.visit_reachable(ch.root, &mut reachable);
+        }
 
         let mut raw_mem_addrs: BTreeMap<u64, Option<u8>> = BTreeMap::new();
         let mut reg_map: BTreeMap<(u8, String), (String, u8, Option<u64>)> = BTreeMap::new();
@@ -2411,11 +3598,7 @@ impl<'a> CCodeEmitter<'a> {
                     width,
                     sample,
                 } => {
-                    let key = if *reg_slot >= 64 {
-                        (*reg_slot, name.clone())
-                    } else {
-                        (*reg_slot, String::new())
-                    };
+                    let key = (*reg_slot, name.clone());
                     reg_map
                         .entry(key)
                         .and_modify(|e| {
@@ -2472,11 +3655,14 @@ impl<'a> CCodeEmitter<'a> {
             .map(|((slot, _), (name, w, s))| (slot, name, w, s))
             .collect();
 
-        // 2. 统计父引用次数，识别需要 CSE 抽成局部变量的共享子表达式
+        // 2. 跨全部输出根联合统计父引用次数，一次共享 CSE 抽公共子表达式
         let mut ref_count: HashMap<NodeId, usize> = HashMap::new();
         let mut order: Vec<NodeId> = Vec::new();
         let mut visited = HashSet::new();
-        collect_postorder(arena, root, &mut visited, &mut ref_count, &mut order);
+        for ch in chunks {
+            collect_postorder(arena, ch.root, &mut visited, &mut ref_count, &mut order);
+        }
+        let root_set: HashSet<NodeId> = chunks.iter().map(|c| c.root).collect();
 
         let mut emitter = Self {
             arena,
@@ -2484,6 +3670,16 @@ impl<'a> CCodeEmitter<'a> {
             mem_bufs,
             sym_regs,
             used_tables,
+            need_load16: false,
+            need_load32: false,
+            need_load64: false,
+            need_store16: false,
+            need_store32: false,
+            need_store64: false,
+            need_aes_aese: false,
+            need_aes_aesd: false,
+            need_aes_mc: false,
+            need_aes_imc: false,
             need_rotr32: false,
             need_rotr64: false,
             need_bswap16: false,
@@ -2493,6 +3689,8 @@ impl<'a> CCodeEmitter<'a> {
             need_rbit64: false,
             need_clz32: false,
             need_clz64: false,
+            need_ashr8: false,
+            need_ashr16: false,
             need_ashr32: false,
             need_ashr64: false,
             need_udiv32: false,
@@ -2509,7 +3707,7 @@ impl<'a> CCodeEmitter<'a> {
         // 将引用次数 >= 2 且非叶子的节点提升为局部变量 `t0, t1, ...`
         let mut tmp_idx = 0usize;
         for &id in &order {
-            if id == root {
+            if !is_multi_buf && root_set.contains(&id) {
                 continue;
             }
             let rc = ref_count.get(&id).copied().unwrap_or(0);
@@ -2522,81 +3720,156 @@ impl<'a> CCodeEmitter<'a> {
                 emitter.cse_names.insert(id, cname);
             }
         }
-        let root_expr = emitter.fmt_expr(root, 0);
-        let ret_type = c_uint_type(arena.width(root));
+
+        let mut body_tail = String::new();
+        let ret_type = if is_multi_buf {
+            for ch in chunks {
+                let expr = emitter.fmt_expr(ch.root, 0);
+                let off = ch.byte_offset;
+                let dst = if off == 0 {
+                    "out".to_string()
+                } else {
+                    format!("out + {off}")
+                };
+                match ch.byte_len {
+                    1 => body_tail.push_str(&format!("    out[{off}] = {expr};\n")),
+                    2 => {
+                        emitter.need_store16 = true;
+                        body_tail.push_str(&format!("    STORE16_LE({dst}, {expr});\n"));
+                    }
+                    4 => {
+                        emitter.need_store32 = true;
+                        body_tail.push_str(&format!("    STORE32_LE({dst}, {expr});\n"));
+                    }
+                    _ => {
+                        emitter.need_store64 = true;
+                        body_tail.push_str(&format!("    STORE64_LE({dst}, {expr});\n"));
+                    }
+                }
+            }
+            "void"
+        } else {
+            let root = chunks[0].root;
+            let root_expr = emitter.fmt_expr(root, 0);
+            body_tail.push_str(&format!("    return {root_expr};\n"));
+            c_uint_type(arena.width(root))
+        };
 
         // 3. 拼装完整自包含 C 代码
         let mut code = String::new();
         code.push_str("#include <stdint.h>\n\n");
+        let mut any_helper = false;
+        if emitter.need_load16 {
+            code.push_str("static inline uint16_t LOAD16_LE(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }\n");
+            any_helper = true;
+        }
+        if emitter.need_load32 {
+            code.push_str("static inline uint32_t LOAD32_LE(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }\n");
+            any_helper = true;
+        }
+        if emitter.need_load64 {
+            code.push_str("static inline uint64_t LOAD64_LE(const uint8_t *p) { return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) | ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56); }\n");
+            any_helper = true;
+        }
+        if emitter.need_store16 {
+            code.push_str("static inline void STORE16_LE(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }\n");
+            any_helper = true;
+        }
+        if emitter.need_store32 {
+            code.push_str("static inline void STORE32_LE(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }\n");
+            any_helper = true;
+        }
+        if emitter.need_store64 {
+            code.push_str("static inline void STORE64_LE(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; ++i) p[i] = (uint8_t)(v >> (i * 8)); }\n");
+            any_helper = true;
+        }
         if emitter.need_rotr32 {
             code.push_str("static inline uint32_t ROTR32(uint32_t x, unsigned n) { return (x >> (n & 31)) | (x << ((32 - n) & 31)); }\n");
+            any_helper = true;
         }
         if emitter.need_rotr64 {
             code.push_str("static inline uint64_t ROTR64(uint64_t x, unsigned n) { return (x >> (n & 63)) | (x << ((64 - n) & 63)); }\n");
+            any_helper = true;
         }
         if emitter.need_bswap16 {
             code.push_str("static inline uint16_t BSWAP16(uint16_t x) { return (uint16_t)((x << 8) | (x >> 8)); }\n");
+            any_helper = true;
         }
         if emitter.need_bswap32 {
             code.push_str("static inline uint32_t BSWAP32(uint32_t x) { return __builtin_bswap32(x); }\n");
+            any_helper = true;
         }
         if emitter.need_bswap64 {
             code.push_str("static inline uint64_t BSWAP64(uint64_t x) { return __builtin_bswap64(x); }\n");
+            any_helper = true;
         }
         if emitter.need_rbit32 {
             code.push_str("static inline uint32_t RBIT32(uint32_t x) { uint32_t r = 0; for (int i = 0; i < 32; ++i) { r = (r << 1) | (x & 1u); x >>= 1; } return r; }\n");
+            any_helper = true;
         }
         if emitter.need_rbit64 {
             code.push_str("static inline uint64_t RBIT64(uint64_t x) { uint64_t r = 0; for (int i = 0; i < 64; ++i) { r = (r << 1) | (x & 1ull); x >>= 1; } return r; }\n");
+            any_helper = true;
         }
         if emitter.need_clz32 {
             code.push_str("static inline uint32_t CLZ32(uint32_t x) { return x ? (uint32_t)__builtin_clz(x) : 32u; }\n");
+            any_helper = true;
         }
         if emitter.need_clz64 {
             code.push_str("static inline uint64_t CLZ64(uint64_t x) { return x ? (uint64_t)__builtin_clzll(x) : 64ull; }\n");
+            any_helper = true;
+        }
+        if emitter.need_ashr8 {
+            code.push_str("static inline uint8_t ASHR8(uint8_t x, uint32_t n) { return (uint8_t)((int8_t)x >> (n & 7u)); }\n");
+            any_helper = true;
+        }
+        if emitter.need_ashr16 {
+            code.push_str("static inline uint16_t ASHR16(uint16_t x, uint32_t n) { return (uint16_t)((int16_t)x >> (n & 15u)); }\n");
+            any_helper = true;
         }
         if emitter.need_ashr32 {
             code.push_str("static inline uint32_t ASHR32(uint32_t x, uint32_t n) { return (uint32_t)((int32_t)x >> (n & 31u)); }\n");
+            any_helper = true;
         }
         if emitter.need_ashr64 {
             code.push_str("static inline uint64_t ASHR64(uint64_t x, uint64_t n) { return (uint64_t)((int64_t)x >> (n & 63u)); }\n");
+            any_helper = true;
         }
         if emitter.need_udiv32 {
             code.push_str("static inline uint32_t UDIV32(uint32_t a, uint32_t b) { return b ? (a / b) : 0u; }\n");
+            any_helper = true;
         }
         if emitter.need_udiv64 {
             code.push_str("static inline uint64_t UDIV64(uint64_t a, uint64_t b) { return b ? (a / b) : 0ull; }\n");
+            any_helper = true;
         }
         if emitter.need_sdiv32 {
             code.push_str("static inline uint32_t SDIV32(uint32_t a, uint32_t b) { int32_t sa = (int32_t)a, sb = (int32_t)b; if (sb == 0) return 0u; if (sa == (-2147483647 - 1) && sb == -1) return a; return (uint32_t)(sa / sb); }\n");
+            any_helper = true;
         }
         if emitter.need_sdiv64 {
             code.push_str("static inline uint64_t SDIV64(uint64_t a, uint64_t b) { int64_t sa = (int64_t)a, sb = (int64_t)b; if (sb == 0) return 0ull; if (sa == (-9223372036854775807LL - 1) && sb == -1) return a; return (uint64_t)(sa / sb); }\n");
+            any_helper = true;
         }
         if emitter.need_umulh64 {
             code.push_str("#ifdef __SIZEOF_INT128__\nstatic inline uint64_t UMULH64(uint64_t a, uint64_t b) { return (uint64_t)(((unsigned __int128)a * (unsigned __int128)b) >> 64); }\n#else\nstatic inline uint64_t UMULH64(uint64_t a, uint64_t b) { uint64_t a0 = a & 0xffffffffull, a1 = a >> 32, b0 = b & 0xffffffffull, b1 = b >> 32; uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint64_t mid = (p00 >> 32) + (p01 & 0xffffffffull) + (p10 & 0xffffffffull); return p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32); }\n#endif\n");
+            any_helper = true;
         }
         if emitter.need_smulh64 {
             code.push_str("#ifdef __SIZEOF_INT128__\nstatic inline uint64_t SMULH64(uint64_t a, uint64_t b) { return (uint64_t)(((__int128)(int64_t)a * (__int128)(int64_t)b) >> 64); }\n#else\nstatic inline uint64_t SMULH64(uint64_t a, uint64_t b) { uint64_t ua = a, ub = b, hi = 0; uint64_t a0 = ua & 0xffffffffull, a1 = ua >> 32, b0 = ub & 0xffffffffull, b1 = ub >> 32; uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint64_t mid = (p00 >> 32) + (p01 & 0xffffffffull) + (p10 & 0xffffffffull); hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32); if ((int64_t)a < 0) hi -= ub; if ((int64_t)b < 0) hi -= ua; return hi; }\n#endif\n");
+            any_helper = true;
         }
-        if emitter.need_rotr32
-            || emitter.need_rotr64
-            || emitter.need_bswap16
-            || emitter.need_bswap32
-            || emitter.need_bswap64
-            || emitter.need_rbit32
-            || emitter.need_rbit64
-            || emitter.need_clz32
-            || emitter.need_clz64
-            || emitter.need_ashr32
-            || emitter.need_ashr64
-            || emitter.need_udiv32
-            || emitter.need_udiv64
-            || emitter.need_sdiv32
-            || emitter.need_sdiv64
-            || emitter.need_umulh64
-            || emitter.need_smulh64
-        {
+        if emitter.need_aes_aese || emitter.need_aes_aesd || emitter.need_aes_mc || emitter.need_aes_imc {
+            emit_c_aes_helpers(
+                &mut code,
+                emitter.need_aes_aese,
+                emitter.need_aes_aesd,
+                emitter.need_aes_mc,
+                emitter.need_aes_imc,
+            );
+            any_helper = true;
+        }
+        if any_helper {
             code.push('\n');
         }
 
@@ -2617,6 +3890,9 @@ impl<'a> CCodeEmitter<'a> {
             let elem_ty = c_uint_type(tbl.elem_bytes * 8);
             params.push(format!("const {elem_ty} *{}", tbl.name));
         }
+        if is_multi_buf {
+            params.push("uint8_t *out".to_string());
+        }
         let param_str = if params.is_empty() {
             "void".to_string()
         } else {
@@ -2628,7 +3904,7 @@ impl<'a> CCodeEmitter<'a> {
             code.push_str(st);
             code.push('\n');
         }
-        code.push_str(&format!("    return {root_expr};\n"));
+        code.push_str(&body_tail);
         code.push_str("}\n");
 
         // 附加输入/表/自校验样本注释，方便逆向工程师直接对照或写单元测试
@@ -2666,7 +3942,7 @@ impl<'a> CCodeEmitter<'a> {
             ));
             out_inputs.push(DecompiledInput {
                 name: name.clone(),
-                kind: if *slot >= 64 { "hle_source" } else { "reg" },
+                kind: if *slot >= 96 { "hle_source" } else { "reg" },
                 addr: None,
                 width_bytes: (*w as usize) / 8,
                 sample_hex: sh,
@@ -2685,16 +3961,115 @@ impl<'a> CCodeEmitter<'a> {
                 tbl.name, tbl.base_addr, tbl.elem_bytes
             ));
         }
-        if let Some(exp) = expected_out {
-            code.push_str(&format!(" *   expected_output  = 0x{exp:x}\n"));
-        }
-        if let Some(ev) = eval_out {
-            code.push_str(&format!(" *   evaluated_output = 0x{ev:x}\n"));
+        if is_multi_buf {
+            if let Some(exp_hex) = expected_bytes_hex {
+                code.push_str(&format!(" *   expected_output  = [{exp_hex}]\n"));
+            }
+            if let Some(ev_hex) = eval_bytes_hex {
+                code.push_str(&format!(" *   evaluated_output = [{ev_hex}]\n"));
+            }
+        } else {
+            if let Some(exp) = expected_out {
+                code.push_str(&format!(" *   expected_output  = 0x{exp:x}\n"));
+            }
+            if let Some(ev) = eval_out {
+                code.push_str(&format!(" *   evaluated_output = 0x{ev:x}\n"));
+            }
         }
         code.push_str(&format!(" *   verified         = {verified:?}\n"));
         code.push_str(" */\n");
 
         (code, out_inputs, out_tables)
+    }
+
+    /// 识别连续小端输入字节加载链：`in_k[off] | (in_k[off+1] << 8) | ...` -> `(buf_idx, off)`
+    fn match_le_mem_load(&self, root_or: NodeId, width: u8) -> Option<(usize, usize)> {
+        let num_bytes = (width / 8) as usize;
+        let mut terms = Vec::with_capacity(num_bytes);
+        let mut stack = vec![root_or];
+        while let Some(cur) = stack.pop() {
+            if cur != root_or && self.cse_names.contains_key(&cur) {
+                return None;
+            }
+            if let BvNode::BinOp {
+                op: BvBinOp::Or,
+                a,
+                b,
+                width: w,
+            } = self.arena.get(cur)
+            {
+                if *w == width {
+                    stack.push(*b);
+                    stack.push(*a);
+                    continue;
+                }
+            }
+            terms.push(cur);
+            if terms.len() > num_bytes {
+                return None;
+            }
+        }
+        if terms.len() != num_bytes {
+            return None;
+        }
+        let mut lanes: Vec<Option<(usize, usize, u64)>> = vec![None; num_bytes];
+        for term in terms {
+            if self.cse_names.contains_key(&term) {
+                return None;
+            }
+            let (inner, lane) = match self.arena.get(term) {
+                BvNode::BinOp {
+                    op: BvBinOp::Shl,
+                    a,
+                    b,
+                    ..
+                } => {
+                    let sh = self.arena.as_const(*b)?;
+                    if !sh.is_multiple_of(8) || sh >= u64::from(width) {
+                        return None;
+                    }
+                    (*a, (sh / 8) as usize)
+                }
+                _ => (term, 0usize),
+            };
+            let addr = self.extract_sym_mem_addr(inner)?;
+            let &(bidx, off) = self.mem_map.get(&addr)?;
+            if lane >= num_bytes || lanes[lane].is_some() {
+                return None;
+            }
+            lanes[lane] = Some((bidx, off, addr));
+        }
+        let (bidx0, off0, addr0) = lanes[0]?;
+        for (i, item) in lanes.iter().enumerate().skip(1) {
+            let (bi, oi, ai) = (*item)?;
+            if bi != bidx0 || oi != off0 + i || ai != addr0.wrapping_add(i as u64) {
+                return None;
+            }
+        }
+        Some((bidx0, off0))
+    }
+
+    fn extract_sym_mem_addr(&self, mut id: NodeId) -> Option<u64> {
+        loop {
+            if self.cse_names.contains_key(&id) {
+                return None;
+            }
+            match self.arena.get(id) {
+                BvNode::SymMemByte { addr, .. } => return Some(*addr),
+                BvNode::UnOp {
+                    op: BvUnOp::ZExt,
+                    x,
+                    ..
+                } => id = *x,
+                BvNode::BinOp {
+                    op: BvBinOp::And,
+                    a,
+                    b,
+                    ..
+                } if self.arena.as_const(*b) == Some(0xFF) => id = *a,
+                _ => return None,
+            }
+        }
     }
 
     fn fmt_expr(&mut self, id: NodeId, parent_prec: u8) -> String {
@@ -2731,9 +4106,44 @@ impl<'a> CCodeEmitter<'a> {
                 let sidx = self.fmt_expr(idx, 0);
                 format!("{}[{sidx}]", self.arena.tables[table_id].name)
             }
-            BvNode::Opaque { asm, .. } => {
+            BvNode::AesOp {
+                kind,
+                state_lo,
+                state_hi,
+                key_lo,
+                key_hi,
+                hi_half,
+            } => {
+                let slo = self.fmt_expr(state_lo, 0);
+                let shi = self.fmt_expr(state_hi, 0);
+                let half = if hi_half { "HI" } else { "LO" };
+                match kind {
+                    AesOpKind::Aese => {
+                        self.need_aes_aese = true;
+                        let klo = key_lo.map(|k| self.fmt_expr(k, 0)).unwrap_or_else(|| "0ULL".to_string());
+                        let khi = key_hi.map(|k| self.fmt_expr(k, 0)).unwrap_or_else(|| "0ULL".to_string());
+                        format!("AES_AESE_{half}({slo}, {shi}, {klo}, {khi})")
+                    }
+                    AesOpKind::Aesd => {
+                        self.need_aes_aesd = true;
+                        let klo = key_lo.map(|k| self.fmt_expr(k, 0)).unwrap_or_else(|| "0ULL".to_string());
+                        let khi = key_hi.map(|k| self.fmt_expr(k, 0)).unwrap_or_else(|| "0ULL".to_string());
+                        format!("AES_AESD_{half}({slo}, {shi}, {klo}, {khi})")
+                    }
+                    AesOpKind::Aesmc => {
+                        self.need_aes_mc = true;
+                        format!("AES_MC_{half}({slo}, {shi})")
+                    }
+                    AesOpKind::Aesimc => {
+                        self.need_aes_imc = true;
+                        format!("AES_IMC_{half}({slo}, {shi})")
+                    }
+                }
+            }
+            BvNode::Opaque { asm, width, .. } => {
                 let safe = asm.replace("*/", "* /").replace("/*", "/ *");
-                format!("(/* opaque: {safe} */ 0u)")
+                let lit = if width > 32 { "0ULL" } else { "0u" };
+                format!("(/* opaque: {safe} */ {lit})")
             }
             BvNode::Extract { x, lsb, width } => {
                 let sx = self.fmt_expr(x, 14);
@@ -2816,6 +4226,29 @@ impl<'a> CCodeEmitter<'a> {
                 }
             },
             BvNode::BinOp { op, a, b, width } => {
+                if op == BvBinOp::Or && matches!(width, 16 | 32 | 64) {
+                    if let Some((bidx, off)) = self.match_le_mem_load(id, width) {
+                        let ptr = if off == 0 {
+                            self.mem_bufs[bidx].name.clone()
+                        } else {
+                            format!("{} + {off}", self.mem_bufs[bidx].name)
+                        };
+                        return match width {
+                            16 => {
+                                self.need_load16 = true;
+                                format!("LOAD16_LE({ptr})")
+                            }
+                            32 => {
+                                self.need_load32 = true;
+                                format!("LOAD32_LE({ptr})")
+                            }
+                            _ => {
+                                self.need_load64 = true;
+                                format!("LOAD64_LE({ptr})")
+                            }
+                        };
+                    }
+                }
                 if op == BvBinOp::Ror {
                     let sa = self.fmt_expr(a, 0);
                     let sb = self.fmt_expr(b, 0);
@@ -2884,7 +4317,13 @@ impl<'a> CCodeEmitter<'a> {
                     let sa = self.fmt_expr(a, 0);
                     self.suppress_mulh_hint = prev_sup;
                     let sb = self.fmt_expr(b, 0);
-                    return if width <= 32 {
+                    return if width <= 8 {
+                        self.need_ashr8 = true;
+                        format!("ASHR8({sa}, {sb}){hint}")
+                    } else if width <= 16 {
+                        self.need_ashr16 = true;
+                        format!("ASHR16({sa}, {sb}){hint}")
+                    } else if width <= 32 {
                         self.need_ashr32 = true;
                         format!("ASHR32({sa}, {sb}){hint}")
                     } else {
@@ -2966,10 +4405,10 @@ impl<'a> CCodeEmitter<'a> {
                     BvBinOp::Mul => ("*", 13, 13, 14),
                     BvBinOp::Add => ("+", 12, 12, 13),
                     BvBinOp::Sub => ("-", 12, 12, 13),
-                    // 位运算混合时给子表达式加括号（满足 Clang `-Wall -Werror -Wbitwise-op-parentheses`）
-                    BvBinOp::And => ("&", 8, 9, 9),
-                    BvBinOp::Xor => ("^", 7, 9, 9),
-                    BvBinOp::Or => ("|", 6, 9, 9),
+                    // 混合位运算与算术/移位时给子表达式加括号（同时满足 GCC `-Werror=parentheses` 与 Clang `-Wbitwise-op-parentheses`）
+                    BvBinOp::And => ("&", 8, 13, 13),
+                    BvBinOp::Xor => ("^", 7, 13, 13),
+                    BvBinOp::Or => ("|", 6, 13, 13),
                     BvBinOp::Ror
                     | BvBinOp::Ashr
                     | BvBinOp::UDiv
@@ -2998,14 +4437,63 @@ impl<'a> CCodeEmitter<'a> {
     }
 }
 
+fn emit_c_aes_helpers(code: &mut String, aese: bool, aesd: bool, mc: bool, imc: bool) {
+    let push_table = |out: &mut String, name: &str, tbl: &[u8; 256]| {
+        out.push_str(&format!("static const uint8_t {name}[256] = {{"));
+        for (i, &b) in tbl.iter().enumerate() {
+            if i % 16 == 0 {
+                out.push_str("\n    ");
+            }
+            out.push_str(&format!("0x{b:02x}"));
+            if i + 1 < 256 {
+                out.push_str(", ");
+            }
+        }
+        out.push_str("\n};\n");
+    };
+    code.push_str("static inline uint64_t aes_pack64(const uint8_t *p) { uint64_t r = 0; for (int i = 0; i < 8; ++i) r |= ((uint64_t)p[i] << (i * 8)); return r; }\n");
+    code.push_str("static inline void aes_unpack128(uint64_t lo, uint64_t hi, uint8_t out[16]) { for (int i = 0; i < 8; ++i) { out[i] = (uint8_t)(lo >> (i * 8)); out[i + 8] = (uint8_t)(hi >> (i * 8)); } }\n");
+    if aese {
+        push_table(code, "AES_SBOX", &AES_SBOX);
+        code.push_str("static inline void AES_AESE_128(uint64_t slo, uint64_t shi, uint64_t klo, uint64_t khi, uint8_t out[16]) { uint8_t s[16]; aes_unpack128(slo ^ klo, shi ^ khi, s); for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) out[c * 4 + r] = AES_SBOX[s[((c + r) & 3) * 4 + r]]; }\n");
+        code.push_str("static inline uint64_t AES_AESE_LO(uint64_t slo, uint64_t shi, uint64_t klo, uint64_t khi) { uint8_t o[16]; AES_AESE_128(slo, shi, klo, khi, o); return aes_pack64(o); }\n");
+        code.push_str("static inline uint64_t AES_AESE_HI(uint64_t slo, uint64_t shi, uint64_t klo, uint64_t khi) { uint8_t o[16]; AES_AESE_128(slo, shi, klo, khi, o); return aes_pack64(o + 8); }\n");
+    }
+    if aesd {
+        push_table(code, "AES_INV_SBOX", &AES_INV_SBOX);
+        code.push_str("static inline void AES_AESD_128(uint64_t slo, uint64_t shi, uint64_t klo, uint64_t khi, uint8_t out[16]) { uint8_t s[16]; aes_unpack128(slo ^ klo, shi ^ khi, s); for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) out[c * 4 + r] = AES_INV_SBOX[s[((c + 4 - r) & 3) * 4 + r]]; }\n");
+        code.push_str("static inline uint64_t AES_AESD_LO(uint64_t slo, uint64_t shi, uint64_t klo, uint64_t khi) { uint8_t o[16]; AES_AESD_128(slo, shi, klo, khi, o); return aes_pack64(o); }\n");
+        code.push_str("static inline uint64_t AES_AESD_HI(uint64_t slo, uint64_t shi, uint64_t klo, uint64_t khi) { uint8_t o[16]; AES_AESD_128(slo, shi, klo, khi, o); return aes_pack64(o + 8); }\n");
+    }
+    if mc || imc {
+        code.push_str("static inline uint8_t aes_xtime(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80u) ? 0x1bu : 0u)); }\n");
+    }
+    if mc {
+        code.push_str("static inline void AES_MC_128(uint64_t slo, uint64_t shi, uint8_t out[16]) { uint8_t s[16]; aes_unpack128(slo, shi, s); for (int c = 0; c < 4; ++c) { uint8_t b0 = s[c*4], b1 = s[c*4+1], b2 = s[c*4+2], b3 = s[c*4+3]; uint8_t x0 = aes_xtime(b0), x1 = aes_xtime(b1), x2 = aes_xtime(b2), x3 = aes_xtime(b3); out[c*4] = x0 ^ x1 ^ b1 ^ b2 ^ b3; out[c*4+1] = b0 ^ x1 ^ x2 ^ b2 ^ b3; out[c*4+2] = b0 ^ b1 ^ x2 ^ x3 ^ b3; out[c*4+3] = x0 ^ b0 ^ b1 ^ b2 ^ x3; } }\n");
+        code.push_str("static inline uint64_t AES_MC_LO(uint64_t slo, uint64_t shi) { uint8_t o[16]; AES_MC_128(slo, shi, o); return aes_pack64(o); }\n");
+        code.push_str("static inline uint64_t AES_MC_HI(uint64_t slo, uint64_t shi) { uint8_t o[16]; AES_MC_128(slo, shi, o); return aes_pack64(o + 8); }\n");
+    }
+    if imc {
+        code.push_str("static inline uint8_t aes_gmul(uint8_t a, uint8_t b) { uint8_t p = 0; for (int i = 0; i < 8; ++i) { if (b & 1u) p ^= a; a = aes_xtime(a); b >>= 1; } return p; }\n");
+        code.push_str("static inline void AES_IMC_128(uint64_t slo, uint64_t shi, uint8_t out[16]) { uint8_t s[16]; aes_unpack128(slo, shi, s); for (int c = 0; c < 4; ++c) { uint8_t b0 = s[c*4], b1 = s[c*4+1], b2 = s[c*4+2], b3 = s[c*4+3]; out[c*4] = aes_gmul(b0, 0x0e) ^ aes_gmul(b1, 0x0b) ^ aes_gmul(b2, 0x0d) ^ aes_gmul(b3, 0x09); out[c*4+1] = aes_gmul(b0, 0x09) ^ aes_gmul(b1, 0x0e) ^ aes_gmul(b2, 0x0b) ^ aes_gmul(b3, 0x0d); out[c*4+2] = aes_gmul(b0, 0x0d) ^ aes_gmul(b1, 0x09) ^ aes_gmul(b2, 0x0e) ^ aes_gmul(b3, 0x0b); out[c*4+3] = aes_gmul(b0, 0x0b) ^ aes_gmul(b1, 0x0d) ^ aes_gmul(b2, 0x09) ^ aes_gmul(b3, 0x0e); } }\n");
+        code.push_str("static inline uint64_t AES_IMC_LO(uint64_t slo, uint64_t shi) { uint8_t o[16]; AES_IMC_128(slo, shi, o); return aes_pack64(o); }\n");
+        code.push_str("static inline uint64_t AES_IMC_HI(uint64_t slo, uint64_t shi) { uint8_t o[16]; AES_IMC_128(slo, shi, o); return aes_pack64(o + 8); }\n");
+    }
+}
+
 fn sanitize_c_ident(raw: &str) -> String {
     const C_KEYWORDS: &[&str] = &[
         "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else",
         "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long", "register",
         "restrict", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef",
-        "union", "unsigned", "void", "volatile", "while", "ROTR32", "ROTR64", "BSWAP16",
-        "BSWAP32", "BSWAP64", "RBIT32", "RBIT64", "CLZ32", "CLZ64", "ASHR32", "ASHR64", "UDIV32",
-        "UDIV64", "SDIV32", "SDIV64", "UMULH64", "SMULH64",
+        "union", "unsigned", "void", "volatile", "while", "uint8_t", "uint16_t", "uint32_t",
+        "uint64_t", "int8_t", "int16_t", "int32_t", "int64_t", "out", "LOAD16_LE", "LOAD32_LE",
+        "LOAD64_LE", "STORE16_LE", "STORE32_LE", "STORE64_LE", "AES_SBOX", "AES_INV_SBOX",
+        "AES_AESE_128", "AES_AESE_LO", "AES_AESE_HI", "AES_AESD_128", "AES_AESD_LO", "AES_AESD_HI",
+        "AES_MC_128", "AES_MC_LO", "AES_MC_HI", "AES_IMC_128", "AES_IMC_LO", "AES_IMC_HI",
+        "aes_pack64", "aes_unpack128", "aes_xtime", "aes_gmul", "ROTR32", "ROTR64", "BSWAP16",
+        "BSWAP32", "BSWAP64", "RBIT32", "RBIT64", "CLZ32", "CLZ64", "ASHR8", "ASHR16", "ASHR32",
+        "ASHR64", "UDIV32", "UDIV64", "SDIV32", "SDIV64", "UMULH64", "SMULH64",
     ];
     let trimmed = raw.trim();
     let mut out = String::with_capacity(trimmed.len());
@@ -3121,10 +4609,18 @@ fn wrap_prec(s: String, prec: u8, parent_prec: u8) -> String {
 }
 
 fn is_leaf_or_trivial(arena: &BvArena, id: NodeId) -> bool {
-    matches!(
-        arena.get(id),
-        BvNode::Const { .. } | BvNode::SymReg { .. } | BvNode::SymMemByte { .. }
-    )
+    match arena.get(id) {
+        BvNode::Const { .. } | BvNode::SymReg { .. } | BvNode::SymMemByte { .. } => true,
+        BvNode::UnOp {
+            op: BvUnOp::ZExt | BvUnOp::Trunc,
+            x,
+            ..
+        } => matches!(
+            arena.get(*x),
+            BvNode::SymMemByte { .. } | BvNode::SymReg { .. }
+        ),
+        _ => false,
+    }
 }
 
 fn collect_postorder(
@@ -3150,32 +4646,52 @@ fn collect_postorder(
         BvNode::TableLoad { idx, .. } => {
             collect_postorder(arena, *idx, visited, ref_count, order);
         }
-        BvNode::Opaque { args, .. } => {
-            for &a in args {
-                collect_postorder(arena, a, visited, ref_count, order);
+        BvNode::AesOp {
+            state_lo,
+            state_hi,
+            key_lo,
+            key_hi,
+            ..
+        } => {
+            collect_postorder(arena, *state_lo, visited, ref_count, order);
+            collect_postorder(arena, *state_hi, visited, ref_count, order);
+            if let Some(k) = key_lo {
+                collect_postorder(arena, *k, visited, ref_count, order);
             }
+            if let Some(k) = key_hi {
+                collect_postorder(arena, *k, visited, ref_count, order);
+            }
+        }
+        BvNode::Opaque { .. } => {
+            // Opaque 在 C/SMT2 导出中作为独立占位符，不遍历其 args，避免产生未被引用的 CSE 临时变量
         }
     }
     order.push(id);
 }
 
-/// 将化简后的 Bit-Vector DAG 导出为标准 `QF_BV` / `QF_UFBV` SMT-LIB2（可直接喂给 Z3 / Bitwuzla 求解逆向输入）
-fn emit_smt2(arena: &BvArena, root: NodeId, expected_out: Option<u64>) -> String {
+/// 将化简后的 Bit-Vector DAG（支持多输出缓冲区）导出为标准 `QF_BV` / `QF_UFBV` SMT-LIB2（可直接喂给 Z3 / Bitwuzla）
+fn emit_smt2_multi(arena: &BvArena, chunks: &[OutputChunkSpec]) -> String {
     let mut visited = HashSet::new();
     let mut ref_count = HashMap::new();
     let mut order = Vec::new();
-    collect_postorder(arena, root, &mut visited, &mut ref_count, &mut order);
+    for ch in chunks {
+        collect_postorder(arena, ch.root, &mut visited, &mut ref_count, &mut order);
+    }
 
-    let has_table = order
-        .iter()
-        .any(|&id| matches!(arena.get(id), BvNode::TableLoad { .. }));
-    let mut out = if has_table {
+    let has_uf = order.iter().any(|&id| {
+        matches!(
+            arena.get(id),
+            BvNode::TableLoad { .. } | BvNode::AesOp { .. }
+        )
+    });
+    let mut out = if has_uf {
         String::from("(set-logic QF_UFBV)\n")
     } else {
         String::from("(set-logic QF_BV)\n")
     };
     let mut declared_syms = BTreeSet::new();
     let mut declared_tables: HashMap<(usize, u8), String> = HashMap::new();
+    let mut declared_aes: HashSet<(AesOpKind, bool)> = HashSet::new();
     let mut names: HashMap<NodeId, String> = HashMap::new();
 
     for &id in &order {
@@ -3222,6 +4738,18 @@ fn emit_smt2(arena: &BvArena, root: NodeId, expected_out: Option<u64>) -> String
                         ));
                     }
                     ent.insert(tname);
+                }
+            }
+            BvNode::AesOp { kind, hi_half, .. } if declared_aes.insert((*kind, *hi_half)) => {
+                let fname = smt_aes_fn_name(*kind, *hi_half);
+                if matches!(kind, AesOpKind::Aese | AesOpKind::Aesd) {
+                    out.push_str(&format!(
+                        "(declare-fun {fname} ((_ BitVec 64) (_ BitVec 64) (_ BitVec 64) (_ BitVec 64)) (_ BitVec 64))\n"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "(declare-fun {fname} ((_ BitVec 64) (_ BitVec 64)) (_ BitVec 64))\n"
+                    ));
                 }
             }
             _ => {}
@@ -3302,6 +4830,25 @@ fn emit_smt2(arena: &BvArena, root: NodeId, expected_out: Option<u64>) -> String
                 let tname = &declared_tables[&(*table_id, idx_w)];
                 format!("({tname} {sidx})")
             }
+            BvNode::AesOp {
+                kind,
+                state_lo,
+                state_hi,
+                key_lo,
+                key_hi,
+                hi_half,
+            } => {
+                let fname = smt_aes_fn_name(*kind, *hi_half);
+                let slo = &names[state_lo];
+                let shi = &names[state_hi];
+                if matches!(kind, AesOpKind::Aese | AesOpKind::Aesd) {
+                    let klo = key_lo.map(|k| names[&k].as_str()).unwrap_or("(_ bv0 64)");
+                    let khi = key_hi.map(|k| names[&k].as_str()).unwrap_or("(_ bv0 64)");
+                    format!("({fname} {slo} {shi} {klo} {khi})")
+                } else {
+                    format!("({fname} {slo} {shi})")
+                }
+            }
             BvNode::Opaque { .. } | BvNode::SymReg { .. } | BvNode::SymMemByte { .. } => {
                 unreachable!()
             }
@@ -3311,14 +4858,29 @@ fn emit_smt2(arena: &BvArena, root: NodeId, expected_out: Option<u64>) -> String
         names.insert(id, nname);
     }
 
-    let root_name = &names[&root];
-    let rw = arena.width(root).max(1);
-    if let Some(exp) = expected_out {
-        let em = exp & width_mask(rw);
-        out.push_str(&format!("(assert (= {root_name} (_ bv{em} {rw})))\n"));
+    for ch in chunks {
+        let root_name = &names[&ch.root];
+        let rw = arena.width(ch.root).max(1);
+        if let Some(exp) = ch.expected {
+            let em = exp & width_mask(rw);
+            out.push_str(&format!("(assert (= {root_name} (_ bv{em} {rw})))\n"));
+        }
     }
     out.push_str("(check-sat)\n(get-model)\n");
     out
+}
+
+fn smt_aes_fn_name(kind: AesOpKind, hi_half: bool) -> &'static str {
+    match (kind, hi_half) {
+        (AesOpKind::Aese, false) => "aes_aese_lo",
+        (AesOpKind::Aese, true) => "aes_aese_hi",
+        (AesOpKind::Aesd, false) => "aes_aesd_lo",
+        (AesOpKind::Aesd, true) => "aes_aesd_hi",
+        (AesOpKind::Aesmc, false) => "aes_mc_lo",
+        (AesOpKind::Aesmc, true) => "aes_mc_hi",
+        (AesOpKind::Aesimc, false) => "aes_imc_lo",
+        (AesOpKind::Aesimc, true) => "aes_imc_hi",
+    }
 }
 
 fn smt_shift_mod(sb: &str, width: u8) -> String {
@@ -3487,6 +5049,9 @@ impl TraceReader {
                     for &(reg_id, _) in &post_deltas {
                         if (reg_id as usize) < 64 {
                             lifter.sym_regs[reg_id as usize] = None;
+                            if reg_id >= 32 {
+                                lifter.sym_vec_hi[(reg_id - 32) as usize] = None;
+                            }
                         }
                     }
                     if let Ok(insn) = bad64::decode(rec.opcode, rec.pc) {
@@ -3494,16 +5059,53 @@ impl TraceReader {
                         if !matches!(
                             mnem.as_str(),
                             "str" | "stur" | "strb" | "sturb" | "strh" | "sturh" | "stp" | "stnp"
-                                | "stlr" | "stlrb" | "stlrh" | "cmp" | "cmn" | "tst" | "cbz"
-                                | "cbnz" | "tbz" | "tbnz" | "b" | "br" | "ret"
+                                | "stlr" | "stlrb" | "stlrh" | "st1" | "cmp" | "cmn" | "tst"
+                                | "cbz" | "cbnz" | "tbz" | "tbnz" | "b" | "br" | "ret"
                         ) && !mnem.starts_with("b.")
                         {
-                            if let Some(Operand::Reg { reg, .. }) = insn.operands().first() {
-                                if let Some(slot) = parse_reg_slot(reg.name()) {
-                                    if (slot as usize) < 64 {
-                                        lifter.sym_regs[slot as usize] = None;
+                            match insn.operands().first() {
+                                Some(Operand::Reg { reg, .. }) => {
+                                    if let Some(slot) = parse_reg_slot(reg.name()) {
+                                        if (slot as usize) < 64 {
+                                            lifter.sym_regs[slot as usize] = None;
+                                            if slot >= 32 {
+                                                lifter.sym_vec_hi[(slot - 32) as usize] = None;
+                                            }
+                                        }
+                                    }
+                                    // LDP/LDNP/LDPSW/LDXP/LDAXP 同时覆写 ops[1]
+                                    if matches!(
+                                        mnem.as_str(),
+                                        "ldp" | "ldnp" | "ldpsw" | "ldxp" | "ldaxp"
+                                    ) {
+                                        if let Some(Operand::Reg { reg: r2, .. }) =
+                                            insn.operands().get(1)
+                                        {
+                                            if let Some(slot2) = parse_reg_slot(r2.name()) {
+                                                if (slot2 as usize) < 64 {
+                                                    lifter.sym_regs[slot2 as usize] = None;
+                                                    if slot2 >= 32 {
+                                                        lifter.sym_vec_hi
+                                                            [(slot2 - 32) as usize] = None;
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
+                                Some(Operand::MultiReg { regs, .. }) => {
+                                    for r in regs.iter().flatten() {
+                                        if let Some(slot) = parse_reg_slot(r.name()) {
+                                            if (slot as usize) < 64 {
+                                                lifter.sym_regs[slot as usize] = None;
+                                                if slot >= 32 {
+                                                    lifter.sym_vec_hi[(slot - 32) as usize] = None;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -3610,8 +5212,13 @@ impl TraceReader {
             }
         }
 
-        // 取出目标 Seed 对应的最终符号表达式与真实输出期望值
-        let (raw_root, expected_output) = match *seed {
+        // 取出目标 Seed 对应的最终符号表达式（标量 1..8B 或多输出缓冲区 9..64B）与真实输出期望值
+        let mut is_multi_buf = false;
+        let output_len: usize;
+        let mut chunks: Vec<OutputChunkSpec> = Vec::new();
+        let mut expected_bytes_opt: Option<Vec<Option<u8>>> = None;
+
+        match *seed {
             TaintSeed::Reg { reg_id } => {
                 let sample = if (reg_id as usize) < 64 {
                     lifter.concrete_regs[reg_id as usize]
@@ -3629,59 +5236,199 @@ impl TraceReader {
                 } else {
                     lifter.arena.c(0, 64)
                 };
-                let exp = sample.map(|v| v & width_mask(lifter.arena.width(expr)));
-                (expr, exp)
+                let w = lifter.arena.width(expr);
+                output_len = (w as usize).div_ceil(8).clamp(1, 8);
+                let exp = sample.map(|v| v & width_mask(w));
+                chunks.push(OutputChunkSpec {
+                    byte_offset: 0,
+                    byte_len: output_len,
+                    root: expr,
+                    expected: exp,
+                    evaluated: None,
+                });
             }
             TaintSeed::Mem { addr, len } => {
-                let eff_len = match len {
-                    1 => 1,
-                    2 => 2,
-                    3..=4 => 4,
-                    _ => 8,
-                };
-                let mut exp_acc = 0u64;
-                let mut all_known = true;
-                for i in 0..eff_len {
-                    if let Some(&b) = last_mem_write_bytes.get(&addr.wrapping_add(i as u64)) {
-                        exp_acc |= u64::from(b) << (i * 8);
-                    } else {
-                        all_known = false;
+                let len = len.max(1);
+                if len <= 8 {
+                    let eff_len = match len {
+                        1 => 1,
+                        2 => 2,
+                        3..=4 => 4,
+                        _ => 8,
+                    };
+                    output_len = eff_len;
+                    let mut exp_acc = 0u64;
+                    let mut all_known = true;
+                    for i in 0..eff_len {
+                        if let Some(&b) = last_mem_write_bytes.get(&addr.wrapping_add(i as u64)) {
+                            exp_acc |= u64::from(b) << (i * 8);
+                        } else {
+                            all_known = false;
+                        }
+                    }
+                    let exp = all_known.then_some(exp_acc);
+                    let expr = lifter.load_sym_bytes_ex(addr, eff_len, exp, false);
+                    chunks.push(OutputChunkSpec {
+                        byte_offset: 0,
+                        byte_len: eff_len,
+                        root: expr,
+                        expected: exp,
+                        evaluated: None,
+                    });
+                } else {
+                    is_multi_buf = true;
+                    let eff_len = len.min(64);
+                    output_len = eff_len;
+                    let mut raw_exp_bytes = Vec::with_capacity(eff_len);
+                    for i in 0..eff_len {
+                        raw_exp_bytes.push(
+                            last_mem_write_bytes
+                                .get(&addr.wrapping_add(i as u64))
+                                .copied(),
+                        );
+                    }
+                    expected_bytes_opt = Some(raw_exp_bytes);
+
+                    let mut off = 0usize;
+                    while off < eff_len {
+                        let rem = eff_len - off;
+                        let clen = if rem >= 8 {
+                            8
+                        } else if rem >= 4 {
+                            4
+                        } else if rem >= 2 {
+                            2
+                        } else {
+                            1
+                        };
+                        let mut exp_acc = 0u64;
+                        let mut all_known = true;
+                        for b in 0..clen {
+                            if let Some(&val_b) =
+                                last_mem_write_bytes.get(&addr.wrapping_add((off + b) as u64))
+                            {
+                                exp_acc |= u64::from(val_b) << (b * 8);
+                            } else {
+                                all_known = false;
+                            }
+                        }
+                        let exp = all_known.then_some(exp_acc);
+                        let expr = lifter.load_sym_bytes_ex(
+                            addr.wrapping_add(off as u64),
+                            clen,
+                            exp,
+                            false,
+                        );
+                        chunks.push(OutputChunkSpec {
+                            byte_offset: off,
+                            byte_len: clen,
+                            root: expr,
+                            expected: exp,
+                            evaluated: None,
+                        });
+                        off += clen;
                     }
                 }
-                let exp = all_known.then_some(exp_acc);
-                let expr = lifter.load_sym_bytes_ex(addr, eff_len, exp, false);
-                (expr, exp)
             }
-        };
+        }
 
-        let raw_nodes = lifter.arena.count_reachable(raw_root);
-        let final_root = if opts.simplify {
-            lifter.arena.simplify_root(raw_root)
+        let raw_roots: Vec<NodeId> = chunks.iter().map(|c| c.root).collect();
+        let raw_nodes = lifter.arena.count_reachable_many(&raw_roots);
+        if opts.simplify {
+            for ch in &mut chunks {
+                ch.root = lifter.arena.simplify_root(ch.root);
+            }
+        }
+        let final_roots: Vec<NodeId> = chunks.iter().map(|c| c.root).collect();
+        let simplified_nodes = lifter.arena.count_reachable_many(&final_roots);
+
+        let mut any_mismatch = false;
+        let mut all_verified = !chunks.is_empty();
+        for ch in &mut chunks {
+            ch.evaluated = lifter.arena.eval_sample(ch.root);
+            match (ch.expected, ch.evaluated) {
+                (Some(exp), Some(ev)) => {
+                    let m = width_mask(lifter.arena.width(ch.root));
+                    if (exp & m) != (ev & m) {
+                        any_mismatch = true;
+                    }
+                }
+                _ => {
+                    all_verified = false;
+                }
+            }
+        }
+        let verified = if any_mismatch {
+            Some(false)
+        } else if all_verified {
+            Some(true)
         } else {
-            raw_root
+            None
         };
-        let simplified_nodes = lifter.arena.count_reachable(final_root);
 
-        let evaluated_output = lifter.arena.eval_sample(final_root);
-        let verified = match (expected_output, evaluated_output) {
-            (Some(exp), Some(ev)) => {
-                let m = width_mask(lifter.arena.width(final_root));
-                Some((exp & m) == (ev & m))
+        let expected_output = if is_multi_buf {
+            None
+        } else {
+            chunks.first().and_then(|c| c.expected)
+        };
+        let evaluated_output = if is_multi_buf {
+            None
+        } else {
+            chunks.first().and_then(|c| c.evaluated)
+        };
+
+        let expected_output_bytes_hex = if let Some(ref bytes) = expected_bytes_opt {
+            if bytes.iter().any(Option::is_some) {
+                let mut s = String::with_capacity(bytes.len() * 2);
+                for b in bytes {
+                    match b {
+                        Some(v) => s.push_str(&format!("{v:02x}")),
+                        None => s.push_str("??"),
+                    }
+                }
+                Some(s)
+            } else {
+                None
             }
-            _ => None,
+        } else {
+            expected_output.map(|v| {
+                let le = v.to_le_bytes();
+                le[..output_len]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            })
         };
 
-        let (c_code, inputs, tables) = CCodeEmitter::emit(
+        let evaluated_output_bytes_hex = if chunks.iter().all(|c| c.evaluated.is_some()) {
+            let mut s = String::with_capacity(output_len * 2);
+            for ch in &chunks {
+                let le = ch.evaluated.unwrap().to_le_bytes();
+                for b in &le[..ch.byte_len] {
+                    s.push_str(&format!("{b:02x}"));
+                }
+            }
+            Some(s)
+        } else {
+            None
+        };
+
+        let (c_code, inputs, tables) = CCodeEmitter::emit_multi(
             &lifter.arena,
-            final_root,
-            &opts.function_name,
-            expected_output,
-            evaluated_output,
-            verified,
+            &chunks,
+            &EmitMeta {
+                is_multi_buf,
+                fn_name: &opts.function_name,
+                expected_out: expected_output,
+                eval_out: evaluated_output,
+                expected_bytes_hex: expected_output_bytes_hex.as_deref(),
+                eval_bytes_hex: evaluated_output_bytes_hex.as_deref(),
+                verified,
+            },
         );
         let smt2 = opts
             .emit_smt2
-            .then(|| emit_smt2(&lifter.arena, final_root, expected_output));
+            .then(|| emit_smt2_multi(&lifter.arena, &chunks));
 
         let slice_insns = bwd.steps.len();
         let taint_steps = if opts.max_steps > 0 && bwd.steps.len() > opts.max_steps {
@@ -3701,8 +5448,11 @@ impl TraceReader {
             inputs,
             tables,
             origin_annotations: bwd.origin_annotations,
+            output_len,
             expected_output,
             evaluated_output,
+            expected_output_bytes_hex,
+            evaluated_output_bytes_hex,
             verified,
             c_code,
             smt2,

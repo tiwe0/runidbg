@@ -4831,6 +4831,8 @@ pub(super) fn register_native_bridge<'js>(
                     let total_ext = reader.ext_len();
                     let missing_ext = reader.missing_ext_warning();
                     let recorded_level = reader.recorded_level_name();
+                    let is_archive = reader.is_archive();
+                    let archive_base = reader.archive_base_addr();
                     let mut h = host
                         .try_borrow_mut()
                         .map_err(|_| throw_err(&ctx, "不可重入"))?;
@@ -4841,6 +4843,12 @@ pub(super) fn register_native_bridge<'js>(
                     out.set("totalInsns", total_insns as f64)?;
                     out.set("totalExt", total_ext as f64)?;
                     out.set("missingExtWarning", missing_ext)?;
+                    out.set("isArchive", is_archive)?;
+                    if let Some(b) = archive_base {
+                        out.set("archiveBaseAddrHex", format!("0x{b:016x}"))?;
+                    } else {
+                        out.set("archiveBaseAddrHex", Value::new_null(ctx.clone()))?;
+                    }
                     if let Some(lvl) = recorded_level {
                         out.set("recordedLevel", lvl)?;
                     } else {
@@ -5400,12 +5408,22 @@ pub(super) fn register_native_bridge<'js>(
                         crate::tracer::TaintSeed::Reg { reg_id: slot }
                     } else if let Some(av) = has_addr {
                         let addr = js_addr_to_u64_strict(&ctx, &av)?;
-                        let len: usize = opts
-                            .get::<_, f64>("len")
-                            .ok()
-                            .filter(|v| v.is_finite() && *v >= 1.0)
-                            .map(|v| (v as usize).min(8))
-                            .unwrap_or(4);
+                        let len: usize = match opts.get::<_, Value<'js>>("len") {
+                            Ok(lv) if !lv.is_undefined() && !lv.is_null() => {
+                                let n = lv.as_number().ok_or_else(|| {
+                                    throw_err(&ctx, "decompileSlice 参数 len 必须为正整数")
+                                })?;
+                                let u = require_nonneg_int(&ctx, n, "len")?;
+                                if u == 0 || u > 64 {
+                                    return Err(throw_err(
+                                        &ctx,
+                                        format!("decompileSlice 参数 len 必须在 1..=64 之间，收到 {u}"),
+                                    ));
+                                }
+                                u as usize
+                            }
+                            _ => 4,
+                        };
                         crate::tracer::TaintSeed::Mem { addr, len }
                     } else {
                         return Err(throw_err(&ctx, "decompileSlice 需要提供 addr 或 reg 参数"));
@@ -5545,11 +5563,18 @@ pub(super) fn register_native_bridge<'js>(
                     out.set("sliceInsns", report.slice_insns as f64)?;
                     out.set("rawNodes", report.raw_nodes as f64)?;
                     out.set("simplifiedNodes", report.simplified_nodes as f64)?;
+                    out.set("outputLen", report.output_len as f64)?;
                     if let Some(exp) = report.expected_output {
                         out.set("expectedOutputHex", format!("0x{exp:x}"))?;
                     }
                     if let Some(ev) = report.evaluated_output {
                         out.set("evaluatedOutputHex", format!("0x{ev:x}"))?;
+                    }
+                    if let Some(ref exp_b) = report.expected_output_bytes_hex {
+                        out.set("expectedOutputBytesHex", exp_b.as_str())?;
+                    }
+                    if let Some(ref ev_b) = report.evaluated_output_bytes_hex {
+                        out.set("evaluatedOutputBytesHex", ev_b.as_str())?;
                     }
                     if let Some(v) = report.verified {
                         out.set("verified", v)?;
@@ -6128,6 +6153,194 @@ pub(super) fn register_native_bridge<'js>(
                     }
                     out.set("spans", spans_arr)?;
                     Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let archive_info_to_js = |ctx: &Ctx<'js>,
+                                  info: &crate::tracer::TraceArchiveInfo|
+         -> rquickjs::Result<Object<'js>> {
+            let o = Object::new(ctx.clone())?;
+            o.set("version", info.version as f64)?;
+            o.set("hasExt", info.has_ext)?;
+            o.set("compressed", info.compressed)?;
+            o.set("baseAddr", info.base_addr as f64)?;
+            o.set("baseAddrHex", format!("0x{:016x}", info.base_addr))?;
+            o.set("idxInsns", info.idx_insns as f64)?;
+            o.set("idxRawLen", info.idx_raw_len as f64)?;
+            o.set("idxCompLen", info.idx_comp_len as f64)?;
+            o.set("idxCrc32Hex", format!("0x{:08x}", info.idx_crc32))?;
+            o.set("extEvents", info.ext_events as f64)?;
+            o.set("extRawLen", info.ext_raw_len as f64)?;
+            o.set("extCompLen", info.ext_comp_len as f64)?;
+            o.set("extCrc32Hex", format!("0x{:08x}", info.ext_crc32))?;
+            o.set("archiveFileLen", info.archive_file_len as f64)?;
+            o.set("ratioPercent", info.ratio_percent())?;
+            if let Some(ref lvl) = info.recorded_level {
+                o.set("recordedLevel", lvl.as_str())?;
+            } else {
+                o.set("recordedLevel", Value::new_null(ctx.clone()))?;
+            }
+            if let Some(ref note) = info.note {
+                o.set("note", note.as_str())?;
+            } else {
+                o.set("note", Value::new_null(ctx.clone()))?;
+            }
+            o.set("summaryText", info.format_summary())?;
+            Ok(o)
+        };
+
+        native.set(
+            "tracePack",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      idx_path: String,
+                      out_opt: Option<String>,
+                      opts: Object<'js>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let idx_p = std::path::PathBuf::from(&idx_path);
+                    let no_ext: bool = match opts.get::<_, Value<'js>>("noExt") {
+                        Ok(v) if !v.is_undefined() && !v.is_null() => v.as_bool().ok_or_else(|| {
+                            throw_err(&ctx, "Trace.pack 参数 noExt 必须为布尔值")
+                        })?,
+                        _ => false,
+                    };
+                    let explicit_ext = match opts.get::<_, Value<'js>>("extPath") {
+                        Ok(v) if !v.is_undefined() && !v.is_null() => {
+                            let s = v
+                                .as_string()
+                                .and_then(|js| js.to_string().ok())
+                                .ok_or_else(|| throw_err(&ctx, "Trace.pack 参数 extPath 必须为非空字符串"))?;
+                            if s.trim().is_empty() {
+                                return Err(throw_err(&ctx, "Trace.pack 参数 extPath 不能为空字符串"));
+                            }
+                            Some(std::path::PathBuf::from(s))
+                        }
+                        _ => None,
+                    };
+                    if no_ext && explicit_ext.is_some() {
+                        return Err(throw_err(&ctx, "Trace.pack 参数 extPath 与 noExt=true 互斥"));
+                    }
+                    let ext_p = if no_ext {
+                        None
+                    } else if explicit_ext.is_some() {
+                        explicit_ext
+                    } else {
+                        crate::tracer::resolve_sibling_ext_path(&idx_p)
+                    };
+                    let out_p = match out_opt {
+                        Some(s) => {
+                            if s.trim().is_empty() {
+                                return Err(throw_err(&ctx, "Trace.pack 参数 outPath 不能为空字符串"));
+                            }
+                            std::path::PathBuf::from(s)
+                        }
+                        None => idx_p.with_extension("rtrace"),
+                    };
+                    let mut pack_opts = crate::tracer::TraceArchivePackOptions::default();
+                    if let Ok(v) = opts.get::<_, Value<'js>>("baseAddr") {
+                        if !v.is_undefined() && !v.is_null() {
+                            pack_opts.base_addr = js_addr_to_u64_strict(&ctx, &v)?;
+                        }
+                    }
+                    if let Ok(v) = opts.get::<_, Value<'js>>("note") {
+                        if !v.is_undefined() && !v.is_null() {
+                            let s = v
+                                .as_string()
+                                .and_then(|js| js.to_string().ok())
+                                .ok_or_else(|| throw_err(&ctx, "Trace.pack 参数 note 必须为字符串"))?;
+                            pack_opts.note = Some(s);
+                        }
+                    }
+                    if let Ok(v) = opts.get::<_, Value<'js>>("level") {
+                        if !v.is_undefined() && !v.is_null() {
+                            let n = v.as_number().ok_or_else(|| {
+                                throw_err(&ctx, "Trace.pack 参数 level 必须为整数 (0..=9)")
+                            })?;
+                            let u = require_nonneg_int(&ctx, n, "level")?;
+                            if u > 9 {
+                                return Err(throw_err(&ctx, format!("Trace.pack 参数 level 必须在 0..=9 之间，收到 {u}")));
+                            }
+                            pack_opts.compression_level = u as u32;
+                        }
+                    }
+                    let info = crate::tracer::TraceArchive::pack(
+                        &idx_p,
+                        ext_p.as_deref(),
+                        &out_p,
+                        &pack_opts,
+                    )
+                    .map_err(|e| throw_err(&ctx, e))?;
+                    let obj = archive_info_to_js(&ctx, &info)?;
+                    obj.set("outPath", out_p.to_string_lossy().as_ref())?;
+                    Ok(obj)
+                },
+            )?,
+        )?;
+
+        native.set(
+            "traceInspectArchive",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, rtrace_path: String| -> rquickjs::Result<Object<'js>> {
+                    let info = crate::tracer::TraceArchive::inspect(&rtrace_path)
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    archive_info_to_js(&ctx, &info)
+                },
+            )?,
+        )?;
+
+        native.set(
+            "traceUnpack",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      rtrace_path: String,
+                      out_dir_opt: Option<String>,
+                      opts: Object<'js>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let rp = std::path::PathBuf::from(&rtrace_path);
+                    let dir = out_dir_opt
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| {
+                            rp.parent()
+                                .filter(|p| !p.as_os_str().is_empty())
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        });
+                    let stem = match opts.get::<_, Value<'js>>("stem") {
+                        Ok(v) if !v.is_undefined() && !v.is_null() => Some(
+                            v.as_string()
+                                .and_then(|js| js.to_string().ok())
+                                .ok_or_else(|| throw_err(&ctx, "Trace.unpack 参数 stem 必须为字符串"))?,
+                        ),
+                        _ => None,
+                    };
+                    let overwrite: bool = match opts.get::<_, Value<'js>>("overwrite") {
+                        Ok(v) if !v.is_undefined() && !v.is_null() => v.as_bool().ok_or_else(|| {
+                            throw_err(&ctx, "Trace.unpack 参数 overwrite 必须为布尔值")
+                        })?,
+                        _ => false,
+                    };
+                    let res = crate::tracer::TraceArchive::unpack(
+                        &rp,
+                        &dir,
+                        stem.as_deref(),
+                        overwrite,
+                    )
+                    .map_err(|e| throw_err(&ctx, e))?;
+                    let o = Object::new(ctx.clone())?;
+                    o.set("idxPath", res.idx_path.to_string_lossy().as_ref())?;
+                    if let Some(ref ep) = res.ext_path {
+                        o.set("extPath", ep.to_string_lossy().as_ref())?;
+                    } else {
+                        o.set("extPath", Value::new_null(ctx.clone()))?;
+                    }
+                    o.set("info", archive_info_to_js(&ctx, &res.info)?)?;
+                    Ok(o)
                 },
             )?,
         )?;

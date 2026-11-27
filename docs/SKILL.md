@@ -1,6 +1,6 @@
 ---
 name: runidbg
-description: Use runidbg (runidbg-cli) to emulate Android ARM64 .so libraries across 4 backends (Unicorn/Dynarmic/KVM/Hypervisor), assemble/relocate ARM64 patches with built-in good64, write QuickJS JNI/Hook/VM/DEX scripts, diagnose missing Android environments with EnvDiag, capture high-speed binary instruction + HLE traces, run offline byte-granular taint/slicing and slice-to-C decompilation (with --from-seq/--stop-at-pc/--stop-mem/--fold-rodata, byte-reassembly & MBA simplification, UMULH/SMULH magic-div recovery & SMT-LIB2), offline memory reconstruction (`mem`), omniscient query, dual-run diff-taint linkage, custom VM analysis, `.rtape` time-travel debugging, multi-core HTTP/JSON-RPC services, embedded Web UI, MCP (39 tools), or GDB RSP.
+description: Use runidbg (runidbg-cli) to emulate Android ARM64 .so libraries across 4 backends (Unicorn/Dynarmic/KVM/Hypervisor), assemble/relocate ARM64 patches with built-in good64, write QuickJS JNI/Hook/VM/DEX scripts, diagnose missing Android environments with EnvDiag, capture high-speed binary instruction + HLE traces (and pack/unpack transparent single-file `.rtrace` archives), run offline byte-granular taint/slicing and decompile v2 (1..64B multi-output joint CSE, LOAD_LE folding, NEON 128-bit lanes & ARMv8-CE hardware AES, --from-seq/--stop-at-pc/--stop-mem/--fold-rodata, byte-reassembly & MBA simplification, UMULH/SMULH magic-div recovery & QF_BV/QF_UFBV SMT-LIB2), offline memory reconstruction (`mem`), omniscient query, dual-run diff-taint linkage, custom VM analysis, `.rtape` time-travel debugging, multi-core HTTP/JSON-RPC services, embedded Web UI, MCP (39 tools), or GDB RSP.
 ---
 
 # runidbg Agent Skill
@@ -121,13 +121,17 @@ emu.call(mod.base + 0x120be0, ...);
 const st = emu.trace.stop();
 if (st.truncated) console.warn("Trace truncated!", st);
 
-// Offline omniscient query, backward causal slicing & VM auto-analysis right in JS:
-const tr = Trace.open("run.idx"); // check tr.missingExtWarning / tr.recordedLevel
+// Pack single-file compressed .rtrace (all offline CLI/JS/MCP/UI commands read .rtrace transparently!):
+Trace.pack("run.idx", "run.rtrace", { baseAddr: mod.base, note: "sign round" });
+const arcInfo = Trace.inspectArchive("run.rtrace");
+
+// Offline omniscient query, backward causal slicing, decompile v2 (1..64B, NEON/AES) & VM auto-analysis:
+const tr = Trace.open("run.rtrace"); // or "run.idx"; check tr.isArchive / tr.missingExtWarning / tr.recordedLevel
 const writes = tr.findWrites(0xdeadbeefn, { width: 4 }); // lossless BigInt hit.value64
 const hist   = tr.findMem(0x50006470, { kind: "w", len: 8, minSeq: 1000, maxSeq: 50000, includeHle: false });
 const snap   = tr.reconstructMem(0x50006470, 16); // snap.bytes is a Uint8Array
 const slice  = tr.taintBackward({ addr: 0x50006470, len: 8, fromIdx: 1000, stopAtPcs: [0x40001200] });
-const pseudo = tr.taintToC({ addr: 0x50006470, len: 8, fromIdx: 1000, foldRodata: true, emitSmt2: true });
+const pseudo = tr.taintToC({ addr: 0x50006470, len: 16, fromIdx: 1000, foldRodata: true, emitSmt2: true });
 const fwd    = tr.taintForward({ addr: 0x50001000, len: 16 });
 const vmRep  = tr.vmAnalyze({ minIdx: 1821500, maxIdx: 1824500, baseReg: "x25", layout: { op: [6, 6], fields: [12, 17, 22, 27] } });
 tr.close();
@@ -154,7 +158,9 @@ runidbg-cli find        run.idx --addr 0x50006470 --len 8 --seq-range 1000..5000
 runidbg-cli find        run.idx --base 0x40000000 --ascii "8404" --limit 10
 runidbg-cli asm         "paciasp; ubfx x0, x1, #4, #8; ret" --pc 0x40001000
 runidbg-cli taint       run.idx --mode backward --addr 0x50006470 --len 8 --from-seq 1922597 --base 0x40000000
-runidbg-cli decompile   run.idx --addr 0x50006470 --len 8 --from-seq 1922597 --fold-rodata --fn round_fn --smt2
+runidbg-cli pack        run.idx --base 0x40000000 --out run.rtrace
+runidbg-cli unpack      run.rtrace --info
+runidbg-cli decompile   run.rtrace --addr 0x50006470 --len 16 --from-seq 1922597 --fold-rodata --fn round_fn --smt2
 runidbg-cli diff        run_a.idx run_b.idx --target-addr 0x50006850 --len 32
 runidbg-cli vm          run.idx --seq-range 1821500..1824500 --base 0x40000000 --base-reg x25 --layout 6:6,12,17,22,27
 runidbg-cli export-ida  run.idx --base 0x40000000 --out ida_cov.py

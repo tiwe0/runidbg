@@ -127,9 +127,12 @@ fn print_usage() {
            runidbg-cli stats <trace.idx> [--base <hex>] [--top N]\n\
            runidbg-cli calltree <trace.idx> [--base <hex>] [--max-depth N] [--min-insns N]\n\
            runidbg-cli crypto-scan <trace.idx> [--ext <trace.ext>] [--base <hex>]\n\
-           runidbg-cli ui <trace.idx|file.rtape> [--ext <trace.ext>] [--base <hex>] [--listen 127.0.0.1:8088] [--open]\n\
-           runidbg-cli export-ida <trace.idx> --base <hex> [--out <script.py>]\n\
-           runidbg-cli export-bn  <trace.idx> --base <hex> [--out <script.py>]\n\
+           runidbg-cli ui <trace.idx|.rtrace|file.rtape> [--ext <trace.ext>] [--base <hex>] [--listen 127.0.0.1:8088] [--open]\n\
+           runidbg-cli export-ida <trace.idx|.rtrace> [--base <hex>] [--out <script.py>]\n\
+           runidbg-cli export-bn  <trace.idx|.rtrace> [--base <hex>] [--out <script.py>]\n\
+           runidbg-cli pack <trace.idx> [--ext <trace.ext>|--no-ext] [--out <out.rtrace>] [--base <hex>] [--note <text>] [--level <0..9>]\n\
+           runidbg-cli unpack <file.rtrace> [--out-dir <dir>] [--stem <name>] [--force] [--info]\n\
+         说明: 全部离线子命令均支持直接读取单文件压缩 `.rtrace` 归档（无需手动解包）。\n\
          Trace 级别说明（JS `emu.trace.start({{ level, capacity }})`）:\n\
            fast      仅记录 PC/Opcode（无 .ext）\n\
            reg_delta 记录 PC/Opcode + 寄存器增量（默认，无内存 .ext）\n\
@@ -433,9 +436,15 @@ fn ui_command(args: &[String]) -> Result<()> {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("rtape"))
-        || fs::read(&input_path)
-            .ok()
-            .is_some_and(|b| b.starts_with(runidbg_arm64_emu_tracer::tape::TAPE_MAGIC));
+        || {
+            use std::io::Read;
+            let magic = runidbg_arm64_emu_tracer::tape::TAPE_MAGIC;
+            let mut head = vec![0u8; magic.len()];
+            fs::File::open(&input_path)
+                .and_then(|mut f| f.read_exact(&mut head))
+                .is_ok()
+                && head.as_slice() == magic
+        };
 
     if is_rtape {
         let handle =
@@ -452,9 +461,6 @@ fn ui_command(args: &[String]) -> Result<()> {
 
     if ext_path.is_none() {
         ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&input_path);
-    }
-    if let Ok(probe_reader) = TraceReader::open(&input_path, ext_path.as_deref()) {
-        warn_if_missing_ext(&probe_reader, &input_path);
     }
 
     let handle = runidbg_arm64_emu_tracer::ui::start_trace_ui_server(
@@ -733,6 +739,137 @@ fn debug_gdb_command(args: &[String]) -> Result<()> {
     runidbg_arm64_emu_tracer::debug::GdbServer::serve(&mut emu, &listen_addr, start_pc, &[])
 }
 
+fn pack_command(args: &[String]) -> Result<()> {
+    let usage = "用法: runidbg-cli pack <trace.idx> [--ext <trace.ext>|--no-ext] [--out <out.rtrace>] [--base <hex>] [--note <text>] [--level <0..9>]";
+    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
+        if args.is_empty() {
+            bail!("{usage}");
+        }
+        eprintln!("{usage}");
+        return Ok(());
+    }
+    let idx_path = PathBuf::from(&args[0]);
+    let mut ext_path: Option<PathBuf> = None;
+    let mut no_ext = false;
+    let mut out_path: Option<PathBuf> = None;
+    let mut opts = runidbg_arm64_emu_tracer::tracer::TraceArchivePackOptions::default();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ext" => {
+                ext_path = Some(PathBuf::from(take_flag_value(
+                    args, &mut i, "pack", "--ext",
+                )?));
+            }
+            "--no-ext" => {
+                no_ext = true;
+                i += 1;
+            }
+            "--out" | "-o" => {
+                let flag = args[i].as_str();
+                out_path = Some(PathBuf::from(take_flag_value(args, &mut i, "pack", flag)?));
+            }
+            "--base" => {
+                let v = take_flag_value(args, &mut i, "pack", "--base")?;
+                opts.base_addr = parse_u64_hex_or_dec(v)?;
+            }
+            "--note" => {
+                opts.note = Some(take_flag_value(args, &mut i, "pack", "--note")?.to_string());
+            }
+            "--level" => {
+                let v = take_flag_value(args, &mut i, "pack", "--level")?;
+                let lvl: u32 = v.parse().context("无效的 --level 值（支持 0..=9）")?;
+                if lvl > 9 {
+                    bail!("pack --level 必须在 0..=9 之间");
+                }
+                opts.compression_level = lvl;
+            }
+            other => bail!("pack 未知参数: {other}"),
+        }
+    }
+
+    if no_ext && ext_path.is_some() {
+        bail!("pack 的 --ext 与 --no-ext 互斥，请只提供其中一个");
+    }
+    if !no_ext && ext_path.is_none() {
+        ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&idx_path);
+    }
+    let final_out = out_path.unwrap_or_else(|| idx_path.with_extension("rtrace"));
+    let info = runidbg_arm64_emu_tracer::tracer::TraceArchive::pack(
+        &idx_path,
+        ext_path.as_deref(),
+        &final_out,
+        &opts,
+    )?;
+    println!("已打包单文件 Trace 归档到 {}", final_out.display());
+    print!("{}", info.format_summary());
+    Ok(())
+}
+
+fn unpack_command(args: &[String]) -> Result<()> {
+    let usage = "用法: runidbg-cli unpack <file.rtrace> [--out-dir <dir>] [--stem <name>] [--force] [--info]";
+    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
+        if args.is_empty() {
+            bail!("{usage}");
+        }
+        eprintln!("{usage}");
+        return Ok(());
+    }
+    let archive_path = PathBuf::from(&args[0]);
+    let mut out_dir: Option<PathBuf> = None;
+    let mut stem: Option<String> = None;
+    let mut force = false;
+    let mut info_only = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out-dir" | "-o" => {
+                let flag = args[i].as_str();
+                out_dir = Some(PathBuf::from(take_flag_value(args, &mut i, "unpack", flag)?));
+            }
+            "--stem" => {
+                stem = Some(take_flag_value(args, &mut i, "unpack", "--stem")?.to_string());
+            }
+            "--force" | "-f" => {
+                force = true;
+                i += 1;
+            }
+            "--info" => {
+                info_only = true;
+                i += 1;
+            }
+            other => bail!("unpack 未知参数: {other}"),
+        }
+    }
+
+    if info_only {
+        let info = runidbg_arm64_emu_tracer::tracer::TraceArchive::inspect(&archive_path)?;
+        print!("{}", info.format_summary());
+        return Ok(());
+    }
+    let dir = out_dir.unwrap_or_else(|| {
+        archive_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+    let res = runidbg_arm64_emu_tracer::tracer::TraceArchive::unpack(
+        &archive_path,
+        &dir,
+        stem.as_deref(),
+        force,
+    )?;
+    println!("已解包 .idx -> {}", res.idx_path.display());
+    if let Some(ref ep) = res.ext_path {
+        println!("已解包 .ext -> {}", ep.display());
+    }
+    print!("{}", res.info.format_summary());
+    Ok(())
+}
+
 fn diff_command(args: &[String]) -> Result<()> {
     let usage = "用法: runidbg-cli diff <a.idx> <b.idx> [--ext-a <a.ext>] [--ext-b <b.ext>] [--base <hex>] [--limit N] [--target-addr <hex> [--len N] [--max-insns N]]";
     if args
@@ -806,6 +943,12 @@ fn diff_command(args: &[String]) -> Result<()> {
     let rb = TraceReader::open(&b_idx, b_ext.as_deref())?;
     warn_if_missing_ext(&ra, &a_idx);
     warn_if_missing_ext(&rb, &b_idx);
+    if base_addr == 0 {
+        base_addr = ra
+            .archive_base_addr()
+            .or_else(|| rb.archive_base_addr())
+            .unwrap_or(0);
+    }
     if let Some(taddr) = target_addr {
         let report = TraceReader::diff_taint_bytes(&ra, &rb, taddr, target_len, max_insns);
         print!("{}", report.format_summary());
@@ -959,6 +1102,11 @@ fn taint_command(args: &[String]) -> Result<()> {
     }
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
     warn_if_missing_ext(&reader, &idx_path);
+    if base_addr == 0 {
+        if let Some(saved_base) = reader.archive_base_addr() {
+            base_addr = saved_base;
+        }
+    }
     let opts = runidbg_arm64_emu_tracer::tracer::TaintOptions {
         anchor_idx,
         min_idx,
@@ -1010,8 +1158,8 @@ fn decompile_command(args: &[String]) -> Result<()> {
             "--len" => {
                 let v = take_flag_value(args, &mut i, "decompile", "--len")?;
                 target_len = v.parse().context("无效的 --len 值")?;
-                if target_len == 0 || target_len > 8 {
-                    bail!("decompile --len 必须在 1..=8 之间");
+                if target_len == 0 || target_len > 64 {
+                    bail!("decompile --len 必须在 1..=64 之间");
                 }
             }
             "--reg" => {
@@ -1244,6 +1392,11 @@ fn vm_command(args: &[String]) -> Result<()> {
     }
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
     warn_if_missing_ext(&reader, &idx_path);
+    if base_addr == 0 {
+        if let Some(saved_base) = reader.archive_base_addr() {
+            base_addr = saved_base;
+        }
+    }
     let report = reader.analyze_vm(&opts);
     print!("{}", report.format_summary(base_addr));
     Ok(())
@@ -1426,6 +1579,8 @@ fn main() -> Result<()> {
         "decompile" => return decompile_command(&args[2..]),
         "vm" => return vm_command(&args[2..]),
         "mem" => return mem_command(&args[2..]),
+        "pack" => return pack_command(&args[2..]),
+        "unpack" => return unpack_command(&args[2..]),
         "ui" => return ui_command(&args[2..]),
         "init-types" => return init_types_command(&args[2..]),
         "-h" | "--help" | "help" => {
@@ -1573,6 +1728,11 @@ fn main() -> Result<()> {
 
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
     warn_if_missing_ext(&reader, &idx_path);
+    if base_addr == 0 {
+        if let Some(saved_base) = reader.archive_base_addr() {
+            base_addr = saved_base;
+        }
+    }
 
     let format_rel = |pc: u64| -> String {
         if base_addr != 0 && pc >= base_addr {
@@ -1610,7 +1770,7 @@ fn main() -> Result<()> {
                         let hint = format_ascii_hint(reg_val, 8).unwrap_or_default();
                         println!("    [REG] {name} <- 0x{reg_val:016x}{hint}");
                     }
-                    if ext_path.is_some() {
+                    if reader.has_ext() {
                         for line in reader.mem_and_hle_lines_for(idx) {
                             println!("{line}");
                         }
@@ -1666,7 +1826,7 @@ fn main() -> Result<()> {
                         decode_instruction_with_reg(pc, op, Some((reg_id, target)))
                     );
                 }
-                if ext_path.is_some() {
+                if reader.has_ext() {
                     let mem_hits: Vec<_> = reader
                         .search_mem_value(target)
                         .into_iter()
