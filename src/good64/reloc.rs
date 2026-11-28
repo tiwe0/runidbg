@@ -9,7 +9,33 @@
 
 use anyhow::{bail, Result};
 
-use super::{encode_abs_jump, encode_branch_trampoline, encode_call_trampoline, encode_mov_imm64};
+use super::{encode_call_trampoline, encode_mov_imm64};
+
+/// BTI-safe 16 字节绝对分支序列：`ldr x16, #8; ret x16; .quad target`
+///
+/// 在 ARMv8.5-A `PROT_BTI` 页上，`RET X16` 将 `PSTATE.BTYPE` 置为 `0b00`，
+/// 可安全跳转到原函数内部任意非 BTI 标签而不触发 `SIGILL`（与 `BR X16` 的 `BTYPE=0b01` 不同）。
+#[inline]
+fn encode_bti_safe_abs_branch(target: u64) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&0x5800_0050u32.to_le_bytes()); // ldr x16, #8
+    out[4..8].copy_from_slice(&0xD65F_0200u32.to_le_bytes()); // ret x16
+    out[8..16].copy_from_slice(&target.to_le_bytes());
+    out
+}
+
+/// 近距 ±128 MiB 用 4B `B`，远距用 16B BTI-safe `ldr x16, #8; ret x16; .quad target`
+#[inline]
+fn encode_reloc_branch(from_pc: u64, target_pc: u64) -> Vec<u8> {
+    if (from_pc & 3) == 0 && (target_pc & 3) == 0 {
+        let delta = (target_pc as i128) - (from_pc as i128);
+        if (-0x0800_0000..=0x07FF_FFFC).contains(&delta) {
+            let imm26 = ((delta >> 2) as u32) & 0x03FF_FFFF;
+            return (0x1400_0000u32 | imm26).to_le_bytes().to_vec();
+        }
+    }
+    encode_bti_safe_abs_branch(target_pc).to_vec()
+}
 
 #[inline]
 fn sign_extend(val: u32, bits: u32) -> i64 {
@@ -36,7 +62,7 @@ fn relocate_instruction_impl(
         return Ok(if is_bl {
             encode_call_trampoline(new_pc, target)
         } else {
-            encode_branch_trampoline(new_pc, target)
+            encode_reloc_branch(new_pc, target)
         });
     }
 
@@ -52,14 +78,14 @@ fn relocate_instruction_impl(
         }
         if cond >= 0xE {
             // B.AL / B.NV 永远成立，超距直接展开为无条件绝对跳板
-            return Ok(encode_branch_trampoline(new_pc, target));
+            return Ok(encode_reloc_branch(new_pc, target));
         }
-        // 超出 ±1 MiB：反转条件跳过 16B 绝对跳板（b.!cond +20; ldr x16, #8; br x16; .quad target）
+        // 超出 ±1 MiB：反转条件跳过 16B BTI-safe 绝对跳板（b.!cond +20; ldr x16, #8; ret x16; .quad target）
         let mut out = Vec::with_capacity(20);
         let inv_cond = cond ^ 1;
         // +0: b.!<cond> +20 (imm19 = 5)
         out.extend_from_slice(&(0x5400_0000 | (5 << 5) | inv_cond).to_le_bytes());
-        out.extend_from_slice(&encode_abs_jump(target));
+        out.extend_from_slice(&encode_bti_safe_abs_branch(target));
         return Ok(out);
     }
 
@@ -73,11 +99,11 @@ fn relocate_instruction_impl(
             let rewritten = (word & 0xFF00_001F) | (imm19 << 5);
             return Ok(rewritten.to_le_bytes().to_vec());
         }
-        // 反转 cbz <-> cbnz 跳过 16B 绝对跳板
+        // 反转 cbz <-> cbnz 跳过 16B BTI-safe 绝对跳板
         let mut out = Vec::with_capacity(20);
         let inv = ((word & 0xFF00_001F) ^ (1 << 24)) | (5 << 5);
         out.extend_from_slice(&inv.to_le_bytes());
-        out.extend_from_slice(&encode_abs_jump(target));
+        out.extend_from_slice(&encode_bti_safe_abs_branch(target));
         return Ok(out);
     }
 
@@ -91,11 +117,11 @@ fn relocate_instruction_impl(
             let rewritten = (word & 0xFFF8_001F) | (imm14 << 5);
             return Ok(rewritten.to_le_bytes().to_vec());
         }
-        // 反转 tbz <-> tbnz 跳过 16B 绝对跳板
+        // 反转 tbz <-> tbnz 跳过 16B BTI-safe 绝对跳板
         let mut out = Vec::with_capacity(20);
         let inv = ((word & 0xFFF8_001F) ^ (1 << 24)) | (5 << 5);
         out.extend_from_slice(&inv.to_le_bytes());
-        out.extend_from_slice(&encode_abs_jump(target));
+        out.extend_from_slice(&encode_bti_safe_abs_branch(target));
         return Ok(out);
     }
 

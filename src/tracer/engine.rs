@@ -8,6 +8,7 @@ use unicorn_engine::unicorn_const::{HookType, MemType};
 use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
 use crate::error::EmuResult;
+use crate::tracer::archive::{TraceArchive, TraceArchiveInfo, TraceArchivePackOptions};
 use crate::tracer::record::{
     decode_trace_record, format_ext_record, ExtKind, ExtRecord, HleOpEvent, TraceFilter,
     TraceLevel, TraceRecord, TraceStats,
@@ -84,6 +85,8 @@ pub struct BinaryTracer {
     prev_regs: [u64; 32],
     /// 是否已完成首次快照初始化
     initialized: bool,
+    /// 是否在首条指令 (`seq == 0`) 主动记录入口参数寄存器 (`X0..X7` + `SP`)，供进程内 Hook 场景直接支持反编译位精确自校验
+    record_entry_regs: bool,
     /// 最近一条已记录指令的 `seq_low32` 与 `pc`（供内存 R/W Hook 关联）
     last_seq_low32: u32,
     last_pc: u64,
@@ -114,6 +117,7 @@ impl BinaryTracer {
             active: false,
             prev_regs: [0u64; 32],
             initialized: false,
+            record_entry_regs: false,
             last_seq_low32: 0,
             last_pc: 0,
             truncation_warned: false,
@@ -139,6 +143,7 @@ impl BinaryTracer {
             active: false,
             prev_regs: [0u64; 32],
             initialized: false,
+            record_entry_regs: false,
             last_seq_low32: 0,
             last_pc: 0,
             truncation_warned: false,
@@ -179,6 +184,7 @@ impl BinaryTracer {
             active: false,
             prev_regs: [0u64; 32],
             initialized: false,
+            record_entry_regs: false,
             last_seq_low32: 0,
             last_pc: 0,
             truncation_warned: false,
@@ -194,6 +200,13 @@ impl BinaryTracer {
     #[inline]
     pub fn set_active(&mut self, active: bool) {
         self.active = active;
+    }
+
+    /// 启用后，在首条指令 (`seq == 0`) 自动把入口参数寄存器 `X0..X7` 与 `SP` 写入初始快照，
+    /// 使离线 `decompile` 可直接获得全部 `arg_x0..arg_x7` 样本值并完成 bit-exact 自校验
+    #[inline]
+    pub fn set_record_entry_regs(&mut self, enable: bool) {
+        self.record_entry_regs = enable;
     }
 
     #[inline]
@@ -298,6 +311,29 @@ impl BinaryTracer {
         } else {
             self.prev_regs = *cur_regs;
             self.initialized = true;
+            if self.record_entry_regs {
+                for i in [0usize, 1, 2, 3, 4, 5, 6, 7, 31] {
+                    let cur = cur_regs[i];
+                    diff_mask |= 1u32 << i;
+                    if primary_reg_id == 0xFF {
+                        primary_reg_id = i as u8;
+                        primary_reg_val = cur;
+                    } else {
+                        if !matches!(self.ext_sink, ExtSink::Disabled) {
+                            has_ext = 1;
+                        }
+                        self.push_ext(ExtRecord {
+                            seq_low32: seq32,
+                            kind: ExtKind::RegDeltaExtra as u8,
+                            size_or_reg: i as u8,
+                            _pad: [0; 2],
+                            addr: 0,
+                            value: cur,
+                            pc,
+                        });
+                    }
+                }
+            }
         }
 
         // 记录首条指令的录制级别标记到 `_reserved[1]`（1=Fast, 2=RegDelta, 3=Full），用于离线检测缺失 `.ext`
@@ -580,6 +616,60 @@ impl BinaryTracer {
             ExtSink::Memory(buf) => buf.as_slice(),
             _ => &[],
         }
+    }
+
+    /// 重置内存模式 Tracer 状态以便在池化引擎中复用到下一次调用（保留已分配容量，零重新分配）
+    pub fn reset_in_memory(&mut self) {
+        if let TraceSink::Memory(buf) = &mut self.sink {
+            buf.clear();
+        }
+        if let ExtSink::Memory(buf) = &mut self.ext_sink {
+            buf.clear();
+        }
+        self.prev_regs = [0u64; 32];
+        self.initialized = false;
+        self.last_seq_low32 = 0;
+        self.last_pc = 0;
+        self.truncation_warned = false;
+        self.stats = TraceStats::default();
+    }
+
+    /// 直接将当前已录制的 `.idx` / `.ext` 缓冲打包压缩为 `.rtrace` 单文件归档字节流
+    /// （供进程内混合执行引擎 / Zygisk Companion 直接通过内存或 FD 落盘，无需临时文件）
+    pub fn to_rtrace_bytes(
+        &self,
+        opts: &TraceArchivePackOptions,
+    ) -> EmuResult<(Vec<u8>, TraceArchiveInfo)> {
+        let idx_bytes: &[u8] = match &self.sink {
+            TraceSink::Memory(buf) => {
+                // SAFETY: TraceRecord 为 #[repr(C, packed)] 定长 POD 结构，无填充字节，切片生命周期与 self 绑定
+                unsafe {
+                    std::slice::from_raw_parts(
+                        buf.as_ptr() as *const u8,
+                        buf.len() * size_of::<TraceRecord>(),
+                    )
+                }
+            }
+            TraceSink::Mmap { mmap, written, .. } => {
+                &mmap[..(*written * size_of::<TraceRecord>()).min(mmap.len())]
+            }
+        };
+        let ext_bytes: Option<&[u8]> = match &self.ext_sink {
+            ExtSink::Disabled => None,
+            ExtSink::Memory(buf) => {
+                // SAFETY: ExtRecord 为 #[repr(C, packed)] 定长 POD 结构，无填充字节
+                Some(unsafe {
+                    std::slice::from_raw_parts(
+                        buf.as_ptr() as *const u8,
+                        buf.len() * size_of::<ExtRecord>(),
+                    )
+                })
+            }
+            ExtSink::Mmap { mmap, written, .. } => {
+                Some(&mmap[..(*written * size_of::<ExtRecord>()).min(mmap.len())])
+            }
+        };
+        TraceArchive::pack_slices_to_vec(idx_bytes, ext_bytes, None, opts)
     }
 
     pub fn decode_record(record: &TraceRecord) -> String {

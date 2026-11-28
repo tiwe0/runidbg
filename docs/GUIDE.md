@@ -348,7 +348,7 @@ let vm  = reader.analyze_vm(&VmAnalysisOptions::default());
 
 ## 9. 完整性能基准与 Java `unidbg` 对比
 
-### 9.1 测试口径与与 `unidbg` 实测数据
+### 9.1 测试口径与 `unidbg` 实测数据
 
 > Apple Silicon（10 核 ARM64 macOS），JDK 21（`unidbg 0.9.9`）vs `runidbg-cli --release`。样本为同一份 ~2 MB stripped Android ARM64 安全签名 `.so`（含 `libc++_shared.so`），两边 100% 产出完全一致的有效签名结果。
 
@@ -446,6 +446,7 @@ src/
 ├── jni/                        # JNI 1.6 环境、对象表、LocalFrame、va_list 与 Hook
 ├── memory.rs                   # VMA 虚拟内存与 Coalescing Free-List 堆分配器
 ├── mem_match.rs                # 零依赖 SIMD 通配符扫描器与 4KB 页块影子内存
+├── good64/                     # 纯 Rust ARM64 汇编器与 BTI-safe 指令重定位器（Inline Hook 底座）
 ├── snapshot.rs / tape.rs       # 内存快照与 .rtape 多检查点稀疏脏页格式
 ├── timetravel.rs               # 时间旅行引擎（EventLogBus / 关键帧缓存 / 反向观察点）
 ├── tracer/                     # mmap 双流 Tracer、全知查询/Diff、字节级污点切片、VM 分析器
@@ -454,4 +455,51 @@ src/
 ├── ui/                         # 内置暗黑 Web UI（Trace / 时间旅行 / RPC / EnvDiag）
 ├── script/                     # QuickJS 桥接、Hook、runidbg.d.ts、多核 RPC 与 39 工具 MCP
 └── bin/runidbg-cli.rs          # 统一命令行入口
+crates/runidbg-zygisk/          # Android Zygisk API v4 进程内 1:1 零拷贝混合 Trace 模块
+├── src/config.rs               # 零依赖 RFC 8259 JSON 配置解析器与 Hook 规则匹配
+├── src/mem_map.rs              # 1:1 零拷贝按需缺页路由、Scudo TBI 与 Shadow Pristine Page
+├── src/trampoline.rs           # 纯 Rust ARM64 global_asm! Hook 跳板与原生逃逸调用桥
+├── src/inline_hook.rs          # 基于 good64 的 BTI/PAC Inline Hook、回退重定位与 RELRO 指针替换
+├── src/hybrid.rs               # 线程本地重入池、独立模拟栈/SCS、自动 IFUNC/dladdr HLE 与直出 .rtrace
+├── src/android/                # SVC #0 透传 + Stealth /proc 过滤、ELF64 依赖闭包、GOT/JNI Hook、Zygisk v4 + Companion
+└── module/                     # Magisk / KernelSU / APatch 模块元数据与 config.example.json
 ```
+
+---
+
+## 11. `runidbg-zygisk` 真机进程内混合 Trace（v0.5.0）
+
+针对强环境校验（Binder / Keystore / TEE / 设备指纹 / 复杂 JNI 回调）难以离线补环境的 `.so`，`runidbg-zygisk` 提供 **Magisk / KernelSU / APatch Zygisk API v4** 进程内 1:1 零拷贝混合 Trace 模块（约 **1.3 MB** Zip，支持 Android 15 16KB 页对齐与 Scudo/MTE/PAC/BTI/ShadowCallStack）：
+
+1. **构建或下载模块**：
+   - 从 [GitHub Releases](https://github.com/tiwe0/runidbg/releases/latest) 下载 `runidbg-zygisk-<tag>.zip`，或本地安装 Android NDK + `rustup target add aarch64-linux-android` 后执行 `./scripts/build-zygisk.sh`；
+2. **刷入并编辑配置**（`/data/adb/runidbg/config.json`，仅 Root Companion 可读）：
+   ```json
+   {
+     "package_name": "com.example.target",
+     "target_libs": ["libtarget.so"],
+     "auto_include_app_deps": true,
+     "extra_emulate_libs": [],
+     "force_native_libs": [],
+     "hooks": [
+       "libtarget.so!JNI_OnLoad",
+       "libtarget.so+0x120be0"
+     ],
+     "trace_level": "full",
+     "max_insns": 500000,
+     "max_hits": 4,
+     "max_reentry_depth": 8,
+     "stealth": true,
+     "output_dir": "/data/local/tmp/runidbg"
+   }
+   ```
+   - `package_name` 为空时自动处于休眠状态；非目标应用、`app_zygote` 与 `system_server` 在 `preAppSpecialize` 即刻调用 `DLCLOSE_MODULE_LIBRARY` 卸载，零内存残留；
+   - 目标 `.so` 及其同应用私有目录（含 Split APK）下的 `DT_NEEDED` 依赖在 Unicorn 2.1 `arch_aarch64` 中以 1:1 零拷贝方式执行并自动录制 `HleMalloc`/`HleMemcpy`/`HleMemset`/`HleFree`/`HleSource`；所有 `libc`/`libart`/`JNIEnv` 透明逃逸至真实 Android 运行时，`SVC #0` 直通真实内核（可选 `stealth: true` 过滤 `/proc/self/maps|smaps|status`）；
+   - 命中超过 `max_hits` 后经 `good64` BTI-safe 重定位回退跳板零开销直通原函数；
+   - 当 `exemptFd` 可用时通过 Root Companion 原子写入 `output_dir`（默认 `/data/local/tmp/runidbg/`）；在 Android 15 USAP / 部分 Zygisk Next 实现下若 `exemptFd` 返回 `false`，将自动无损降级写入应用私有缓存 `<app_data_dir>/cache/runidbg/`（`0700`/`0600`）；
+3. **拉取 `.rtrace` 并接入桌面离线分析**：
+   ```bash
+   adb pull /data/local/tmp/runidbg/ ./device_traces/
+   runidbg-cli stats     ./device_traces/<trace>.rtrace
+   runidbg-cli decompile ./device_traces/<trace>.rtrace --reg X0 --fold-rodata --smt2
+   ```

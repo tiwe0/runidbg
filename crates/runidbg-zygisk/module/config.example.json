@@ -1,0 +1,18 @@
+{
+  "package_name": "",
+  "target_libs": [
+    "libtarget.so"
+  ],
+  "auto_include_app_deps": true,
+  "extra_emulate_libs": [],
+  "force_native_libs": [],
+  "hooks": [
+    "libtarget.so!JNI_OnLoad"
+  ],
+  "trace_level": "full",
+  "max_insns": 500000,
+  "max_hits": 4,
+  "max_reentry_depth": 8,
+  "stealth": true,
+  "output_dir": "/data/local/tmp/runidbg"
+}

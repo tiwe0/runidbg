@@ -1,0 +1,18 @@
+[package]
+name = "runidbg-zygisk"
+version = "0.5.0"
+edition = "2021"
+authors = ["Ivory"]
+license = "MIT"
+description = "In-process hybrid ARM64 Unicorn emulator & native-grade .rtrace tracer for Android Zygisk"
+
+[lib]
+name = "runidbg_zygisk"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 仅引入主库 --no-default-features 极简核心（good64 + BinaryTracer + .rtrace，零 QuickJS/axum/dynarmic）
+runidbg-arm64-emu-tracer = { path = "../..", default-features = false }
+# Android 端仅编译 aarch64 单架构，裁剪 ~70% 包体体积
+unicorn-engine = { version = "2.1", default-features = false, features = ["arch_aarch64"] }
+libc = "0.2"

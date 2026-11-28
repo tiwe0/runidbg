@@ -370,6 +370,141 @@ impl TraceArchive {
         })
     }
 
+    /// 直接从内存中的原始 `.idx`（及可选 `.ext`）字节切片裁剪、压缩并编码为完整的 `.rtrace` 归档字节流
+    /// （供进程内混合引擎 / Zygisk Companion 直接通过 FD 落盘，无需在沙盒内产生临时 `.idx`/`.ext` 文件）
+    pub fn pack_slices_to_vec(
+        idx_slice: &[u8],
+        ext_slice: Option<&[u8]>,
+        source_idx_name: Option<&str>,
+        opts: &TraceArchivePackOptions,
+    ) -> EmuResult<(Vec<u8>, TraceArchiveInfo)> {
+        let idx_count = scan_active_idx_count(idx_slice);
+        let idx_raw_len = (idx_count * size_of::<TraceRecord>()) as u64;
+        if idx_raw_len > MAX_RTRACE_RAW_STREAM_BYTES {
+            return Err(invalid_data(format!(
+                ".idx 有效体积 {idx_raw_len} 字节超出归档上限 ({MAX_RTRACE_RAW_STREAM_BYTES})"
+            )));
+        }
+        let idx_active = &idx_slice[..idx_raw_len as usize];
+        let recorded_level = if idx_count > 0 {
+            let tag = read_packed_unaligned::<TraceRecord>(idx_active, 0)._reserved[1];
+            match tag {
+                1 => Some("fast".to_string()),
+                2 => Some("reg_delta".to_string()),
+                3 => Some("full".to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let has_ext = ext_slice.is_some();
+        let (ext_count, ext_raw_len, ext_active): (usize, u64, &[u8]) = if let Some(es) = ext_slice
+        {
+            let cnt = scan_active_ext_count(es);
+            let raw_len = (cnt * size_of::<ExtRecord>()) as u64;
+            if raw_len > MAX_RTRACE_RAW_STREAM_BYTES {
+                return Err(invalid_data(format!(
+                    ".ext 有效体积 {raw_len} 字节超出归档上限 ({MAX_RTRACE_RAW_STREAM_BYTES})"
+                )));
+            }
+            (cnt, raw_len, &es[..raw_len as usize])
+        } else {
+            (0usize, 0u64, &[])
+        };
+
+        let level = opts.compression_level.min(9);
+        let use_deflate = level > 0;
+        let idx_crc32 = crc32_bytes(idx_active);
+        let ext_crc32 = if has_ext { crc32_bytes(ext_active) } else { 0 };
+
+        let idx_payload = compress_stream(idx_active, level)?;
+        let ext_payload = if has_ext {
+            compress_stream(ext_active, level)?
+        } else {
+            Vec::new()
+        };
+
+        let mut meta = BTreeMap::new();
+        if let Some(ref lvl) = recorded_level {
+            meta.insert("level".to_string(), lvl.clone());
+        }
+        meta.insert("insns".to_string(), idx_count.to_string());
+        meta.insert("ext_events".to_string(), ext_count.to_string());
+        if let Some(fname) = source_idx_name {
+            meta.insert("source_idx".to_string(), sanitize_meta_value(fname));
+        }
+        let clean_note = opts
+            .note
+            .as_deref()
+            .map(sanitize_meta_value)
+            .filter(|s| !s.is_empty());
+        if let Some(ref n) = clean_note {
+            meta.insert("note".to_string(), n.clone());
+        }
+        let meta_bytes = encode_meta(&meta);
+        if meta_bytes.len() > MAX_RTRACE_META_LEN {
+            return Err(invalid_data(format!(
+                "归档元数据长度 {} 超出上限 ({MAX_RTRACE_META_LEN})",
+                meta_bytes.len()
+            )));
+        }
+
+        let mut flags = 0u16;
+        if has_ext {
+            flags |= RTRACE_FLAG_HAS_EXT;
+        }
+        if use_deflate {
+            flags |= RTRACE_FLAG_DEFLATE;
+        }
+        let header = encode_header(
+            &ParsedHeader {
+                version: RTRACE_VERSION,
+                flags,
+                base_addr: opts.base_addr,
+                idx_raw_len,
+                idx_comp_len: idx_payload.len() as u64,
+                idx_crc32,
+                ext_crc32,
+                ext_raw_len,
+                ext_comp_len: ext_payload.len() as u64,
+                meta_len: meta_bytes.len() as u32,
+            },
+            &meta_bytes,
+        );
+
+        let total_len =
+            RTRACE_HEADER_SIZE + meta_bytes.len() + idx_payload.len() + ext_payload.len();
+        let mut out = Vec::with_capacity(total_len);
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&meta_bytes);
+        out.extend_from_slice(&idx_payload);
+        if has_ext {
+            out.extend_from_slice(&ext_payload);
+        }
+
+        let info = TraceArchiveInfo {
+            version: RTRACE_VERSION,
+            flags,
+            has_ext,
+            compressed: use_deflate,
+            base_addr: opts.base_addr,
+            idx_insns: idx_count,
+            idx_raw_len,
+            idx_comp_len: idx_payload.len() as u64,
+            idx_crc32,
+            ext_events: ext_count,
+            ext_raw_len,
+            ext_comp_len: ext_payload.len() as u64,
+            ext_crc32,
+            archive_file_len: total_len as u64,
+            recorded_level,
+            note: clean_note,
+            meta,
+        };
+        Ok((out, info))
+    }
+
     /// 仅读取并校验 `.rtrace` 文件头与元数据（O(1)，不解压指令/扩展载荷）
     pub fn inspect(rtrace_path: impl AsRef<Path>) -> EmuResult<TraceArchiveInfo> {
         let mut file = File::open(rtrace_path)?;

@@ -446,6 +446,27 @@ impl TraceReader {
         out
     }
 
+    /// 读取首条指令（`idx == 0`）记录的入口初始寄存器快照（仅当录制器启用了 `set_record_entry_regs(true)` 时非空）
+    pub fn initial_reg_snapshot(&self) -> Vec<(u8, u64)> {
+        let Some(first) = self.get(0) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let pid = first.primary_reg_id;
+        let pval = first.primary_reg_val;
+        if pid != 0xFF {
+            out.push((pid, pval));
+        }
+        if (first._reserved[0] & 1) != 0 {
+            for ext in self.ext_for_seq(first.seq_low32) {
+                if ext.kind == ExtKind::RegDeltaExtra as u8 {
+                    out.push((ext.size_or_reg, ext.value));
+                }
+            }
+        }
+        out
+    }
+
     /// 获取指令 `idx` 自身产生的内存读写事件（过滤掉 `RegDeltaExtra` 与 HLE 伴随记录）
     pub fn mem_events_for(&self, idx: usize) -> Vec<ExtRecord> {
         let Some(rec) = self.get(idx) else {
@@ -631,7 +652,7 @@ impl TraceReader {
         let mut hits = Vec::new();
         let mut seq_to_idx: Option<HashMap<u32, usize>> = None;
 
-        for i in 0..self.idx_count {
+        for i in 1..self.idx_count {
             let rec = read_packed::<TraceRecord>(&self.idx_buf, i);
             let reg_id = rec.primary_reg_id;
             let reg_val = rec.primary_reg_val;
@@ -648,6 +669,9 @@ impl TraceReader {
                     let seq = ext.seq_low32;
                     let map = seq_to_idx.get_or_insert_with(|| self.build_seq_index_map());
                     if let Some(&raw_idx) = map.get(&seq) {
+                        if raw_idx == 0 {
+                            continue;
+                        }
                         if let Some(raw_rec) = self.get(raw_idx) {
                             let (attr_idx, attr_rec) = self.attribute_pre_exec(raw_idx, raw_rec);
                             hits.push((attr_idx, attr_rec, ext.size_or_reg));
@@ -1759,7 +1783,7 @@ impl TraceReader {
                     .push((i, pc, op & 0xFFFF_FC00));
             }
             let reg_id = rec.primary_reg_id;
-            if reg_id != 0xFF {
+            if i > 0 && reg_id != 0xFF {
                 let val = rec.primary_reg_val;
                 if let Some(algos) = const_map64.get(&val) {
                     let (attr_idx, attr_rec) = self.attribute_pre_exec(i, rec);
@@ -1804,6 +1828,9 @@ impl TraceReader {
                     let seq = ext.seq_low32;
                     let map = seq_to_idx.get_or_insert_with(|| self.build_seq_index_map());
                     if let Some(&idx) = map.get(&seq) {
+                        if ext.kind == ExtKind::RegDeltaExtra as u8 && idx == 0 {
+                            continue;
+                        }
                         let (attr_idx, pc) = if ext.kind == ExtKind::RegDeltaExtra as u8 {
                             if let Some(raw_rec) = self.get(idx) {
                                 let (ai, ar) = self.attribute_pre_exec(idx, raw_rec);

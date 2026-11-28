@@ -192,6 +192,12 @@ Start MCP server via stdio (`runidbg-cli mcp --cwd .`) or Streamable HTTP (`runi
 - **`.rtape` & Time-Travel**: `emu_save_tape`, `emu_load_tape`, `emu_seek_tape`, `tape_info`, `tt_record_start`, `tt_record_stop`, `tt_open`, `tt_seek`, `tt_reverse_watch`, `tt_mem_read`, `tt_close`
 - **Diagnostics**: `emu_diag_missing`, `emu_last_crash`
 
+### On-Device Hybrid Tracing (`runidbg-zygisk`, v0.5.0)
+When a target `.so` relies heavily on live Android Binder / TEE / Keystore / complex ART callbacks that are costly to stub offline, use `crates/runidbg-zygisk` (`./scripts/build-zygisk.sh` -> flashable 1.3 MB Magisk/KernelSU/APatch Zygisk v4 Zip):
+- Configure `/data/adb/runidbg/config.json` with `package_name`, `target_libs`, `hooks` (`"libfoo.so!JNI_OnLoad"`, `"libfoo.so+0x12340"`), `trace_level: "full"`, `max_hits`, `max_insns`, and `stealth: true`.
+- Target `.so` + app-private `DT_NEEDED` deps (including Split APKs) run 1:1 zero-copy inside Unicorn 2.1 `arch_aarch64` with Shadow Pristine Pages, isolated ShadowCallStack `X18`, BTI/PAC-safe `good64` inline hooks, automatic IFUNC/dladdr HLE recording, and native escape for `libc`/`libart`/`JNIEnv`/`SVC #0`.
+- Root Companion streams `.rtrace` archives directly to `/data/local/tmp/runidbg/*.rtrace`; `adb pull` them and run `runidbg-cli stats` / `taint` / `decompile` / `vm` / MCP `trace_*` tools directly with zero unpacking.
+
 ## Guardrails & Best Practices
 - Only targets **Android ARM64 (`aarch64`)** ELF shared libraries.
 - Never hardcode or commit real cookies, session tokens, or private keys into scripts or tests.

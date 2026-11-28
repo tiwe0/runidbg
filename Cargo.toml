@@ -1,6 +1,11 @@
+[workspace]
+members = [".", "crates/runidbg-zygisk"]
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "runidbg-arm64-emu-tracer"
-version = "0.4.6"
+version = "0.5.0"
 edition = "2021"
 authors = ["Ivory"]
 license = "MIT"
@@ -25,7 +30,7 @@ kvm = []
 hypervisor = []
 
 [dependencies]
-unicorn-engine = "2.1"
+unicorn-engine = { version = "2.1", default-features = false, features = ["arch_aarch64"] }
 goblin = "0.10"
 bad64 = "0.13"
 memmap2 = "0.9"

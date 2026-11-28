@@ -5014,6 +5014,13 @@ impl TraceReader {
         }
 
         if !self.is_empty() {
+            // 若 Trace 头部记录了入口初始寄存器快照（如进程内混合引擎 `runidbg-zygisk`），先预装具体值，
+            // 使符号提升后的 `arg_x0..arg_x7` 自动带有真实入口样本并可直接通过 bit-exact 自校验。
+            for (reg_id, val) in self.initial_reg_snapshot() {
+                if (reg_id as usize) < lifter.concrete_regs.len() {
+                    lifter.concrete_regs[reg_id as usize].get_or_insert(val);
+                }
+            }
             let end_idx = anchor_idx.min(self.len() - 1);
             for idx in 0..=end_idx {
                 let Some(rec) = self.get(idx) else {

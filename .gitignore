@@ -1,6 +1,8 @@
 /target
+/dist
 **/*.rs.bk
 *.trace
+*.rtrace
 *.db
 *.db-journal
 *.db-wal
